@@ -1,3 +1,4 @@
+#include <hal/nrf_gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -10,14 +11,14 @@
 #include <string.h>
 #include "rgb_led.h"
 #include "ir_sensor.h"
+#include "buzzer.h"
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/console/console.h>
 
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 
 /* ── NUS UUIDs ──────────────────────────────────────────── */
-#define NUS_SERVICE_UUID_VAL \
-    BT_UUID_128_ENCODE(0x6E400001, 0xB5A3, 0xF393, 0xE0A9, 0xE50E24DCCA9E)
 #define NUS_RX_UUID_VAL \
     BT_UUID_128_ENCODE(0x6E400002, 0xB5A3, 0xF393, 0xE0A9, 0xE50E24DCCA9E)
 #define NUS_TX_UUID_VAL \
@@ -26,7 +27,7 @@
 static struct bt_uuid_128 nus_rx_uuid = BT_UUID_INIT_128(NUS_RX_UUID_VAL);
 static struct bt_uuid_128 nus_tx_uuid = BT_UUID_INIT_128(NUS_TX_UUID_VAL);
 
-/* ── Pod names to scan for ──────────────────────────────── */
+/* ── Pod names ──────────────────────────────────────────── */
 #define NUM_ESP32_PODS  3
 static const char *pod_names[NUM_ESP32_PODS] = {
     "Blazepod2", "Blazepod3", "Blazepod4"
@@ -34,21 +35,56 @@ static const char *pod_names[NUM_ESP32_PODS] = {
 
 /* ── Per-pod state ──────────────────────────────────────── */
 typedef struct {
-    struct bt_conn *conn;
-    uint16_t        rx_handle;
-    uint16_t        tx_ccc_handle;
-    bool            connected;
-    bool            handles_found;
+    struct bt_conn                 *conn;
+    uint16_t                        rx_handle;
+    uint16_t                        tx_ccc_handle;
+    bool                            connected;
+    bool                            handles_found;
+    struct bt_gatt_discover_params  disc_params;
+    struct bt_gatt_subscribe_params sub_params;
 } pod_t;
 
 static pod_t pods[NUM_ESP32_PODS];
 
-/* ── IR thread ──────────────────────────────────────────── */
-#define IR_THREAD_STACK_SIZE  2048
-#define IR_THREAD_PRIORITY    5
-#define IR_POLL_INTERVAL_MS   50
-static uint32_t timeout_ms = 3000U;  /* default 10s, settable by phone */
-/* Game mode */
+/* ── Thread config ──────────────────────────────────────── */
+#define IR_THREAD_STACK_SIZE    2048
+#define IR_THREAD_PRIORITY      5
+#define IR_POLL_INTERVAL_MS     50
+#define GAME_THREAD_STACK_SIZE  2048
+#define GAME_THREAD_PRIORITY    6
+#define UART_THREAD_STACK_SIZE  2048
+#define UART_THREAD_PRIORITY    7
+#define BUZZ_THREAD_STACK_SIZE  512
+#define BUZZ_THREAD_PRIORITY    8
+
+K_THREAD_STACK_DEFINE(ir_stack,   IR_THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(game_stack, GAME_THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(uart_stack, UART_THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(buzz_stack, BUZZ_THREAD_STACK_SIZE);
+
+static struct k_thread ir_thread_data;
+static struct k_thread game_thread_data;
+static struct k_thread uart_thread_data;
+static struct k_thread buzz_thread_data;
+
+/* ── Buzzer message queue ───────────────────────────────── */
+typedef enum {
+    BEEP_NONE  = 0,
+    BEEP_SHORT = 1,
+    BEEP_LONG  = 2,
+} beep_type_t;
+
+K_MSGQ_DEFINE(buzz_msgq, sizeof(beep_type_t), 4, 1);
+
+static inline void request_beep(beep_type_t type)
+{
+    k_msgq_put(&buzz_msgq, &type, K_NO_WAIT);
+}
+
+/* ── Timeout ────────────────────────────────────────────── */
+static uint32_t timeout_ms = 10000U;
+
+/* ── Game mode ──────────────────────────────────────────── */
 typedef enum {
     GAME_MODE_1 = 1,
     GAME_MODE_2 = 2
@@ -56,22 +92,11 @@ typedef enum {
 
 static game_mode_t current_mode = GAME_MODE_1;
 
-/* GPIO button */
+/* ── Mode switch GPIO ───────────────────────────────────── */
 #define MODE_BUTTON_NODE DT_ALIAS(mode_switch)
-
 static const struct gpio_dt_spec mode_btn =
     GPIO_DT_SPEC_GET(MODE_BUTTON_NODE, gpios);
 static struct gpio_callback button_cb_data;
-
-K_THREAD_STACK_DEFINE(ir_stack, IR_THREAD_STACK_SIZE);
-static struct k_thread ir_thread_data;
-
-/* ── Game thread ────────────────────────────────────────── */
-#define GAME_THREAD_STACK_SIZE  1024
-#define GAME_THREAD_PRIORITY    6
-
-K_THREAD_STACK_DEFINE(game_stack, GAME_THREAD_STACK_SIZE);
-static struct k_thread game_thread_data;
 
 /* ── Semaphores ─────────────────────────────────────────── */
 static K_SEM_DEFINE(adv_sem,        0, 1);
@@ -85,27 +110,29 @@ static bool            led_active     = false;
 static int64_t         led_on_time_ms = 0;
 static struct bt_conn *phone_conn     = NULL;
 static bool            notif_enabled  = false;
-static bool            round_ended    = false;   /* ← add this */
-static int             odd_pod_index  = -1;    
+static bool            round_ended    = false;
+static int             odd_pod_index  = -1;
 
-/* Current game colour */
+/* ── Game colour (Mode 1) ───────────────────────────────── */
 static uint8_t game_r = 0xFF;
 static uint8_t game_g = 0x00;
 static uint8_t game_b = 0x00;
+
+/* ── Colour tables ──────────────────────────────────────── */
 typedef struct {
     uint8_t     r, g, b;
     const char *name;
 } colour_t;
 
-static const colour_t colours[] = {
-    { 0xFF, 0x00, 0x00, "RED"    },
-    { 0x00, 0xFF, 0x00, "GREEN"  },
-    { 0x00, 0x00, 0xFF, "BLUE"   },
-    { 0xFF, 0xFF, 0x00, "YELLOW" },
-    { 0xFF, 0x14, 0x93, "PINK"   },
-    { 0x94, 0x00, 0xD3, "VIOLET" },
+static const colour_t colours_m2[] = {
+    { 0xFF, 0x00, 0x00, "RED"   },
+    { 0x00, 0xFF, 0x00, "GREEN" },
+    { 0x00, 0x00, 0xFF, "BLUE"  },
 };
-#define NUM_COLOURS ARRAY_SIZE(colours)
+#define NUM_COLOURS_M2 ARRAY_SIZE(colours_m2)
+
+/* ── Track which pod we last tried to connect ───────────── */
+static int last_connecting_pod = -1;
 
 /* ── Advertisement data ─────────────────────────────────── */
 static const struct bt_data ad[] = {
@@ -120,9 +147,72 @@ static const struct bt_data sd[] = {
 static void send_to_phone(const char *msg);
 static void ir_thread_fn(void *p1, void *p2, void *p3);
 static void game_thread_fn(void *p1, void *p2, void *p3);
+static void uart_console_thread_fn(void *p1, void *p2, void *p3);
+static void buzz_thread_fn(void *p1, void *p2, void *p3);
 static void start_scan(void);
 static void write_to_pod(int pod_idx, const char *cmd);
-static void turn_off_all_pods(void); 
+static void turn_off_all_pods(void);
+
+/* ══════════════════════════════════════════════════════════
+ * Buzzer thread
+ * ══════════════════════════════════════════════════════════ */
+static void buzz_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    beep_type_t type;
+    while (true) {
+        k_msgq_get(&buzz_msgq, &type, K_FOREVER);
+        switch (type) {
+        case BEEP_SHORT:
+            buzzer_beep_short();
+            break;
+        case BEEP_LONG:
+            buzzer_beep_long();
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
+ * Helper — build list of available (connected) pods
+ * ══════════════════════════════════════════════════════════ */
+static int build_available(int available[4])
+{
+    int count = 0;
+    available[count++] = 0;
+    for (int i = 0; i < NUM_ESP32_PODS; i++) {
+        if (pods[i].connected && pods[i].handles_found) {
+            available[count++] = i + 1;
+        }
+    }
+    return count;
+}
+
+/* ══════════════════════════════════════════════════════════
+ * Helper — random colour index excluding one value
+ * ══════════════════════════════════════════════════════════ */
+static int random_m2_colour_excluding(int exclude_idx)
+{
+    int idx;
+    do {
+        idx = sys_rand32_get() % NUM_COLOURS_M2;
+    } while (idx == exclude_idx);
+    return idx;
+}
+
+/* ══════════════════════════════════════════════════════════
+ * Turn off all pods
+ * ══════════════════════════════════════════════════════════ */
+static void turn_off_all_pods(void)
+{
+    rgb_led_off();
+    for (int i = 0; i < NUM_ESP32_PODS; i++) {
+        write_to_pod(i, "OFF");
+    }
+}
 
 /* ══════════════════════════════════════════════════════════
  * Send to phone via NUS notify
@@ -130,18 +220,14 @@ static void turn_off_all_pods(void);
 static void send_to_phone(const char *msg)
 {
     if (!notif_enabled) return;
-    if (msg == NULL || strlen(msg) == 0) return;
+    if (!msg || strlen(msg) == 0) return;
 
     k_mutex_lock(&state_mutex, K_FOREVER);
     struct bt_conn *c = phone_conn;
     k_mutex_unlock(&state_mutex);
 
-    if (c == NULL) return;
-
-    int rc = bt_nus_send(c, msg, strlen(msg));
-    if (rc) {
-        printk("bt_nus_send failed rc=%d\n", rc);
-    }
+    if (!c) return;
+    bt_nus_send(c, msg, strlen(msg));
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -180,90 +266,71 @@ static void received_from_phone(struct bt_conn *conn, const void *data,
         if (msg[i] == '\r' || msg[i] == '\n') { msg[i] = '\0'; break; }
     }
 
-    printk("Received: [%s]\n", msg);
+    printk("Rx:[%s]\n", msg);
 
-    /* ── Set timeout (works for both modes) ── */
     if (strncmp(msg, "TIMEOUT:", 8) == 0) {
         int secs = atoi(msg + 8);
-        if (secs > 0) {
+        if (secs >= 1 && secs <= 60) {
             timeout_ms = (uint32_t)(secs * 1000);
-            char reply[32];
-            snprintf(reply, sizeof(reply),
-                     "TIMEOUT SET:%ds\n", secs);
+            char reply[20];
+            snprintf(reply, sizeof(reply), "TO:%ds\n", secs);
             send_to_phone(reply);
-            printk("Timeout set to %d ms\n", timeout_ms);
         } else {
-            send_to_phone("INVALID TIMEOUT\n");
+            send_to_phone("TO:ERR\n");
         }
         return;
     }
 
-    /* ── Stop game (works for both modes) ── */
     if (strcmp(msg, "STOP") == 0) {
         k_mutex_lock(&state_mutex, K_FOREVER);
         game_running = false;
         led_active   = false;
         k_mutex_unlock(&state_mutex);
-
-        rgb_led_off();
-        send_to_phone("GAME STOPPED\n");
-        for (int i = 0; i < NUM_ESP32_PODS; i++) {
-            write_to_pod(i, "OFF");
-        }
+        turn_off_all_pods();
+        send_to_phone("STOPPED\n");
         k_sem_give(&round_done_sem);
         return;
     }
 
-    /* ── Mode 1 only: colour commands start the game ── */
     if (current_mode == GAME_MODE_1) {
-        if (strcmp(msg, "RED") == 0) {
-            game_r = 0xFF; game_g = 0x00; game_b = 0x00;
-        } else if (strcmp(msg, "GREEN") == 0) {
-            game_r = 0x00; game_g = 0xFF; game_b = 0x00;
-        } else if (strcmp(msg, "BLUE") == 0) {
-            game_r = 0x00; game_g = 0x00; game_b = 0xFF;
-        } else if (strcmp(msg, "YELLOW") == 0) {
-            game_r = 0xFF; game_g = 0xFF; game_b = 0x00;
-        } else if (strcmp(msg, "PINK") == 0) {
-            game_r = 0xFF; game_g = 0x14; game_b = 0x93;
-        } else if (strcmp(msg, "VIOLET") == 0) {
-            game_r = 0x94; game_g = 0x00; game_b = 0xD3;
-        } else {
-            send_to_phone("UNKNOWN\n");
-            return;
-        }
+        if      (strcmp(msg, "RED")    == 0) { game_r=0xFF; game_g=0x00; game_b=0x00; }
+        else if (strcmp(msg, "GREEN")  == 0) { game_r=0x00; game_g=0xFF; game_b=0x00; }
+        else if (strcmp(msg, "BLUE")   == 0) { game_r=0x00; game_g=0x00; game_b=0xFF; }
+        else if (strcmp(msg, "YELLOW") == 0) { game_r=0xFF; game_g=0xFF; game_b=0x00; }
+        else if (strcmp(msg, "PINK")   == 0) { game_r=0xFF; game_g=0x14; game_b=0x93; }
+        else if (strcmp(msg, "VIOLET") == 0) { game_r=0x94; game_g=0x00; game_b=0xD3; }
+        else if (strcmp(msg, "START")  == 0) { /* use current colour */ }
+        else { send_to_phone("UNKNOWN\n"); return; }
 
         k_mutex_lock(&state_mutex, K_FOREVER);
         game_running = true;
         k_mutex_unlock(&state_mutex);
-
         k_sem_give(&game_start_sem);
-        send_to_phone("GAME STARTED\n");
+        send_to_phone("M1:GO\n");
         return;
     }
 
-    /* ── Mode 2 only: START command ── */
     if (current_mode == GAME_MODE_2) {
         if (strcmp(msg, "START") == 0) {
             k_mutex_lock(&state_mutex, K_FOREVER);
             game_running = true;
             k_mutex_unlock(&state_mutex);
-
             k_sem_give(&game_start_sem);
-            send_to_phone("GAME STARTED\n");
+            send_to_phone("M2:GO\n");
         } else {
             send_to_phone("UNKNOWN\n");
         }
         return;
     }
 }
+
 static struct bt_nus_cb nus_listener = {
     .notif_enabled = notif_enabled_cb,
     .received      = received_from_phone,
 };
 
 /* ══════════════════════════════════════════════════════════
- * Receive RT/TIMEOUT notification from ESP32 pod
+ * Receive notification from ESP32 pod
  * ══════════════════════════════════════════════════════════ */
 static uint8_t pod_notify_cb(struct bt_conn *conn,
                               struct bt_gatt_subscribe_params *params,
@@ -276,7 +343,13 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
 
     char msg[64] = {0};
     memcpy(msg, data, MIN(length, sizeof(msg) - 1));
-    printk("Pod notify: %s\n", msg);
+
+    int mlen = strlen(msg);
+    if (mlen > 0 && (msg[mlen-1] == '\n' || msg[mlen-1] == '\r')) {
+        msg[mlen-1] = '\0';
+    }
+
+    printk("Pod notify:[%s]\n", msg);
 
     k_mutex_lock(&state_mutex, K_FOREVER);
     game_mode_t mode    = current_mode;
@@ -287,41 +360,67 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
     if (already) return BT_GATT_ITER_CONTINUE;
 
     if (mode == GAME_MODE_1) {
-        send_to_phone(msg);
+        bool m1_timeout = (strstr(msg, ":TIMEOUT") != NULL);
+
+        char fwd[68];
+        snprintf(fwd, sizeof(fwd), "%s\n", msg);
+        send_to_phone(fwd);
+        k_mutex_lock(&state_mutex, K_FOREVER);
+        round_ended = true;
+        k_mutex_unlock(&state_mutex);
+
+        /* Tap on ESP32 pod → short beep. Pod timeout → long beep. */
+        request_beep(m1_timeout ? BEEP_LONG : BEEP_SHORT);   /* ── NEW ── */
+
         k_sem_give(&round_done_sem);
         return BT_GATT_ITER_CONTINUE;
     }
 
-    /* Mode 2 — identify which pod sent this */
-    int tapped_pod = -1;
-    if      (strncmp(msg, "POD2:", 5) == 0) tapped_pod = 1;
-    else if (strncmp(msg, "POD3:", 5) == 0) tapped_pod = 2;
-    else if (strncmp(msg, "POD4:", 5) == 0) tapped_pod = 3;
+    int tapped_avail_idx = -1;
+    if      (strncmp(msg, "POD2:", 5) == 0) tapped_avail_idx = 1;
+    else if (strncmp(msg, "POD3:", 5) == 0) tapped_avail_idx = 2;
+    else if (strncmp(msg, "POD4:", 5) == 0) tapped_avail_idx = 3;
 
-    if (tapped_pod < 0) {
+    if (tapped_avail_idx < 0) {
         send_to_phone(msg);
         return BT_GATT_ITER_CONTINUE;
     }
 
-    bool is_timeout = (strstr(msg, "TIMEOUT") != NULL);
+    bool is_timeout = (strstr(msg, ":TIMEOUT") != NULL);
+
+    if (is_timeout) {
+        char fwd[68];
+        snprintf(fwd, sizeof(fwd), "%s\n", msg);
+        send_to_phone(fwd);
+        return BT_GATT_ITER_CONTINUE;
+    }
 
     turn_off_all_pods();
+
     k_mutex_lock(&state_mutex, K_FOREVER);
     round_ended = true;
     led_active  = false;
     k_mutex_unlock(&state_mutex);
 
-    if (is_timeout) {
-        send_to_phone(msg);
-    } else if (tapped_pod == odd_pod) {
-        /* Correct pod */
-        send_to_phone(msg);
+    printk("M2 judge: tapped=%d odd=%d\n", tapped_avail_idx, odd_pod);
+
+    if (odd_pod < 0) {
+        return BT_GATT_ITER_CONTINUE;
+    }
+
+    if (tapped_avail_idx == odd_pod) {
+        char fwd[68];
+        snprintf(fwd, sizeof(fwd), "%s\n", msg);
+        send_to_phone(fwd);
+        printk("CORRECT pod%d\n", tapped_avail_idx + 1);
+        request_beep(BEEP_SHORT);
     } else {
-        /* Wrong pod */
         char wrong[32];
-        snprintf(wrong, sizeof(wrong),
-                 "POD%d:WRONG\n", tapped_pod + 1);
+        snprintf(wrong, sizeof(wrong), "POD%d:WRONG\n", tapped_avail_idx + 1);
         send_to_phone(wrong);
+        printk("WRONG pod%d tapped odd was pod%d\n",
+               tapped_avail_idx + 1, odd_pod + 1);
+        request_beep(BEEP_LONG);
     }
 
     k_sem_give(&round_done_sem);
@@ -329,63 +428,62 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
 }
 
 /* ══════════════════════════════════════════════════════════
- * GATT discovery — find RX and TX handles on ESP32
+ * GATT discovery
  * ══════════════════════════════════════════════════════════ */
-static struct bt_gatt_discover_params disc_params;
-static struct bt_gatt_subscribe_params sub_params[NUM_ESP32_PODS];
-static int current_disc_pod = -1;
-
 static uint8_t discover_cb(struct bt_conn *conn,
                             const struct bt_gatt_attr *attr,
                             struct bt_gatt_discover_params *params)
 {
-    if (!attr) {
-        printk("Discovery complete for Pod%d\n", current_disc_pod + 2);
-        printk("  rx_handle=%d tx_ccc_handle=%d handles_found=%d\n",
-               pods[current_disc_pod].rx_handle,
-               pods[current_disc_pod].tx_ccc_handle,
-               pods[current_disc_pod].handles_found);
+    int pod_idx = -1;
+    for (int i = 0; i < NUM_ESP32_PODS; i++) {
+        if (params == &pods[i].disc_params) {
+            pod_idx = i;
+            break;
+        }
+    }
+    if (pod_idx < 0) return BT_GATT_ITER_STOP;
 
-        if (current_disc_pod >= 0 &&
-            pods[current_disc_pod].handles_found) {
-            sub_params[current_disc_pod].notify       = pod_notify_cb;
-sub_params[current_disc_pod].value        = BT_GATT_CCC_NOTIFY;
-sub_params[current_disc_pod].ccc_handle   = pods[current_disc_pod].tx_ccc_handle;
-sub_params[current_disc_pod].value_handle = pods[current_disc_pod].tx_ccc_handle - 1;
-int err = bt_gatt_subscribe(conn, &sub_params[current_disc_pod]);
-printk("Subscribe err=%d\n", err);
+    if (!attr) {
+        printk("Discovery done Pod%d rx=%d ccc=%d found=%d\n",
+               pod_idx + 2,
+               pods[pod_idx].rx_handle,
+               pods[pod_idx].tx_ccc_handle,
+               pods[pod_idx].handles_found);
+
+        if (pods[pod_idx].handles_found) {
+            pods[pod_idx].sub_params.notify       = pod_notify_cb;
+            pods[pod_idx].sub_params.value        = BT_GATT_CCC_NOTIFY;
+            pods[pod_idx].sub_params.ccc_handle   =
+                pods[pod_idx].tx_ccc_handle;
+            pods[pod_idx].sub_params.value_handle =
+                pods[pod_idx].tx_ccc_handle - 1;
+            int err = bt_gatt_subscribe(conn,
+                          &pods[pod_idx].sub_params);
+            printk("Subscribe Pod%d err=%d\n", pod_idx + 2, err);
         }
         return BT_GATT_ITER_STOP;
     }
 
-    /* Print every attribute found for debugging */
-    printk("Attr handle=%d\n", attr->handle);
-
-    /* Check RX characteristic by UUID */
     if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
                      &nus_rx_uuid.uuid)) {
-        pods[current_disc_pod].rx_handle =
-            bt_gatt_attr_value_handle(attr);
-        printk("Found RX handle=%d\n",
-               pods[current_disc_pod].rx_handle);
+        pods[pod_idx].rx_handle = bt_gatt_attr_value_handle(attr);
+        printk("Pod%d RX=%d\n", pod_idx + 2, pods[pod_idx].rx_handle);
     }
 
-    /* Check TX characteristic by UUID */
     if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
-                 &nus_tx_uuid.uuid)) {
-    pods[current_disc_pod].tx_ccc_handle = attr->handle + 2;
-    pods[current_disc_pod].handles_found = true;
-    printk("Found TX decl=%d value=%d ccc=%d\n",
-           attr->handle,
-           attr->handle + 1,
-           pods[current_disc_pod].tx_ccc_handle);
-}
+                     &nus_tx_uuid.uuid)) {
+        pods[pod_idx].tx_ccc_handle = attr->handle + 2;
+        pods[pod_idx].handles_found = true;
+        printk("Pod%d TX decl=%d ccc=%d\n",
+               pod_idx + 2, attr->handle,
+               pods[pod_idx].tx_ccc_handle);
+    }
 
     return BT_GATT_ITER_CONTINUE;
 }
 
 /* ══════════════════════════════════════════════════════════
- * BLE scan — look for Blazepod2/3/4
+ * BLE scan
  * ══════════════════════════════════════════════════════════ */
 static bool parse_device_name(struct bt_data *data, void *user_data)
 {
@@ -408,18 +506,13 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
     for (int i = 0; i < NUM_ESP32_PODS; i++) {
         if (strcmp(dev_name, pod_names[i]) == 0 &&
             !pods[i].connected) {
-
-            printk("Found %s — connecting\n", dev_name);
+            printk("Found %s slot=%d\n", dev_name, i);
             bt_le_scan_stop();
-
+            last_connecting_pod = i;
             struct bt_conn *conn = NULL;
-            bt_conn_le_create(addr,
-                              BT_CONN_LE_CREATE_CONN,
-                              BT_LE_CONN_PARAM_DEFAULT,
-                              &conn);
-            if (conn) {
-                bt_conn_unref(conn);
-            }
+            bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+                              BT_LE_CONN_PARAM_DEFAULT, &conn);
+            if (conn) bt_conn_unref(conn);
             return;
         }
     }
@@ -433,15 +526,11 @@ static void start_scan(void)
     }
     if (!need) return;
 
-    /* Use slower scan interval so advertising gaps are preserved
-     * interval = 500ms, window = 50ms
-     * This means nRF scans for 50ms then rests 450ms
-     * During the 450ms rest it can advertise and accept connections */
     struct bt_le_scan_param scan_param = {
         .type     = BT_LE_SCAN_TYPE_ACTIVE,
         .options  = BT_LE_SCAN_OPT_NONE,
-        .interval = 0x0500,   /* 800ms */
-        .window   = 0x0050,   /* 50ms  */
+        .interval = 0x0500,
+        .window   = 0x0050,
     };
     bt_le_scan_start(&scan_param, scan_cb);
     printk("Scanning...\n");
@@ -453,7 +542,8 @@ static void start_scan(void)
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) {
-        printk("Connection failed err=%d\n", err);
+        printk("Conn failed err=%d\n", err);
+        last_connecting_pod = -1;
         start_scan();
         return;
     }
@@ -462,30 +552,29 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
     bt_conn_get_info(conn, &info);
 
     if (info.role == BT_CONN_ROLE_CENTRAL) {
-        /* Connected to an ESP32 pod */
-        for (int i = 0; i < NUM_ESP32_PODS; i++) {
-            if (!pods[i].connected && pods[i].conn == NULL) {
-                pods[i].conn      = bt_conn_ref(conn);
-                pods[i].connected = true;
-                current_disc_pod  = i;
+        int idx = last_connecting_pod;
+        last_connecting_pod = -1;
 
-                printk("Connected to Pod%d — discovering\n", i + 2);
-
-                /* Discover ALL characteristics — no UUID filter */
-disc_params.uuid         = NULL;   /* NULL = find everything */
-disc_params.func         = discover_cb;
-disc_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
-disc_params.end_handle   = BT_ATT_LAST_ATTRIBUTE_HANDLE;
-disc_params.type         = BT_GATT_DISCOVER_CHARACTERISTIC;
-int err = bt_gatt_discover(conn, &disc_params);
-printk("Discovery started err=%d\n", err);
-                break;
-            }
+        if (idx < 0 || idx >= NUM_ESP32_PODS) {
+            printk("Invalid pod slot\n");
+            start_scan();
+            return;
         }
+
+        pods[idx].conn      = bt_conn_ref(conn);
+        pods[idx].connected = true;
+        printk("Pod%d connected slot=%d\n", idx + 2, idx);
+
+        pods[idx].disc_params.uuid         = NULL;
+        pods[idx].disc_params.func         = discover_cb;
+        pods[idx].disc_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+        pods[idx].disc_params.end_handle   = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+        pods[idx].disc_params.type         = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+        bt_gatt_discover(conn, &pods[idx].disc_params);
         start_scan();
 
     } else {
-        /* Connected to phone */
         printk("Phone connected\n");
         k_mutex_lock(&state_mutex, K_FOREVER);
         phone_conn = bt_conn_ref(conn);
@@ -523,11 +612,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
         led_active    = false;
         notif_enabled = false;
         k_mutex_unlock(&state_mutex);
-
-        rgb_led_off();
-        for (int i = 0; i < NUM_ESP32_PODS; i++) {
-            write_to_pod(i, "OFF");
-        }
+        turn_off_all_pods();
         k_sem_give(&adv_sem);
     }
 }
@@ -538,7 +623,47 @@ static struct bt_conn_cb conn_callbacks = {
 };
 
 /* ══════════════════════════════════════════════════════════
- * IR thread — Pod 1 (nRF own LED + IR)
+ * Mode switch button callback
+ * ══════════════════════════════════════════════════════════ */
+static void button_pressed(const struct device *dev,
+                            struct gpio_callback *cb,
+                            uint32_t pins)
+{
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
+
+    if (gpio_pin_get_dt(&mode_btn) != 1) {
+        return;
+    }
+
+    if (current_mode == GAME_MODE_1) {
+        current_mode = GAME_MODE_2;
+        printk("MODE 2\n");
+        send_to_phone("MODE:2\n");
+    } else {
+        current_mode = GAME_MODE_1;
+        printk("MODE 1\n");
+        send_to_phone("MODE:1\n");
+    }
+
+    k_mutex_lock(&state_mutex, K_FOREVER);
+    bool running = game_running;
+    k_mutex_unlock(&state_mutex);
+
+    if (running) {
+        turn_off_all_pods();
+        k_mutex_lock(&state_mutex, K_FOREVER);
+        led_active  = false;
+        round_ended = true;
+        k_mutex_unlock(&state_mutex);
+        k_sem_give(&round_done_sem);
+        k_sem_give(&game_start_sem);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
+ * IR thread
  * ══════════════════════════════════════════════════════════ */
 static void ir_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -561,196 +686,89 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
 
         int64_t elapsed = k_uptime_get() - start;
 
-        /* Timeout */
         if (elapsed >= timeout_ms) {
-    k_mutex_lock(&state_mutex, K_FOREVER);
-    bool already = round_ended;
-    k_mutex_unlock(&state_mutex);
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            bool        already = round_ended;
+            game_mode_t mode    = current_mode;
+            k_mutex_unlock(&state_mutex);
 
-    if (!already) {
-        turn_off_all_pods();
-        k_mutex_lock(&state_mutex, K_FOREVER);
-        led_active  = false;
-        round_ended = true;
-        k_mutex_unlock(&state_mutex);
-
-        send_to_phone("POD1:TIMEOUT\n");
-        printk("POD1:TIMEOUT\n");
-        k_sem_give(&round_done_sem);
-    }
-    prev_detected = false;
-    continue;
-}
-
-       bool detected = ir_sensor_detected();
-
-if (!detected || prev_detected) {
-    prev_detected = detected;
-    continue;
-}
-prev_detected = detected;
-
-k_mutex_lock(&state_mutex, K_FOREVER);
-bool        already  = round_ended;
-game_mode_t mode     = current_mode;
-int         odd_pod  = odd_pod_index;
-k_mutex_unlock(&state_mutex);
-
-if (already) continue;
-
-if (mode == GAME_MODE_1) {
-    rgb_led_off();
-    k_mutex_lock(&state_mutex, K_FOREVER);
-    led_active  = false;
-    round_ended = true;
-    k_mutex_unlock(&state_mutex);
-
-    char msg[32];
-    snprintf(msg, sizeof(msg),
-             "POD1:RT:%d\n", (int32_t)elapsed);
-    send_to_phone(msg);
-    printk("%s", msg);
-    k_sem_give(&round_done_sem);
-
-} else {
-    /* Mode 2 — check if pod 1 is the odd pod */
-    turn_off_all_pods();
-    k_mutex_lock(&state_mutex, K_FOREVER);
-    led_active  = false;
-    round_ended = true;
-    k_mutex_unlock(&state_mutex);
-
-    if (odd_pod == 0) {
-        /* Correct pod tapped */
-        char msg[32];
-        snprintf(msg, sizeof(msg),
-                 "POD1:RT:%d\n", (int32_t)elapsed);
-        send_to_phone(msg);
-        printk("%s", msg);
-    } else {
-        /* Wrong pod tapped */
-        send_to_phone("POD1:WRONG\n");
-        printk("POD1:WRONG\n");
-    }
-    k_sem_give(&round_done_sem);
-}
-    }
-}
-/* Replace the mutex-based button_pressed with this */
-static void button_pressed(const struct device *dev,
-                            struct gpio_callback *cb,
-                            uint32_t pins)
-{
-    ARG_UNUSED(dev);
-    ARG_UNUSED(cb);
-    ARG_UNUSED(pins);
-
-    if (current_mode == GAME_MODE_1) {
-        current_mode = GAME_MODE_2;
-        printk("Switched to MODE 2\n");
-    } else {
-        current_mode = GAME_MODE_1;
-        printk("Switched to MODE 1\n");
-    }
-
-    /* If game is running, stop current round cleanly
-     * and signal game thread to restart in new mode */
-    if (game_running) {
-        turn_off_all_pods();
-        led_active  = false;
-        round_ended = true;
-        k_sem_give(&round_done_sem);   /* unblocks current round */
-        k_sem_give(&game_start_sem);   /* restarts game in new mode */
-    }
-}
-static int random_colour_excluding(int exclude_idx)
-{
-    int idx;
-    do {
-        idx = sys_rand32_get() % NUM_COLOURS;
-    } while (idx == exclude_idx);
-    return idx;
-}
-static void turn_off_all_pods(void)
-{
-    rgb_led_off();
-    for (int i = 0; i < NUM_ESP32_PODS; i++) {
-        write_to_pod(i, "OFF");
-    }
-}
-/* ══════════════════════════════════════════════════════════
- * Game thread — random pod selection loop
- * ══════════════════════════════════════════════════════════ */
-static void run_game_mode2(void)
-{
-    while (true) {
-        k_mutex_lock(&state_mutex, K_FOREVER);
-        bool     running = game_running;
-        uint32_t t_out   = timeout_ms;
-        k_mutex_unlock(&state_mutex);
-
-        if (!running) break;
-
-        /* Pick majority and odd colours */
-        int maj_idx = sys_rand32_get() % NUM_COLOURS;
-        int odd_idx = random_colour_excluding(maj_idx);
-
-        /* Pick which pod gets the odd colour 0=nRF 1-3=ESP32 */
-        int odd_pod = sys_rand32_get() % 4;
-
-        printk("Mode2: maj=%s odd=%s odd_pod=%d\n",
-               colours[maj_idx].name,
-               colours[odd_idx].name,
-               odd_pod + 1);
-
-        k_mutex_lock(&state_mutex, K_FOREVER);
-        odd_pod_index = odd_pod;
-        round_ended   = false;
-        k_mutex_unlock(&state_mutex);
-
-        int64_t round_start = k_uptime_get();
-
-        /* Light all 4 pods simultaneously */
-        for (int i = 0; i < 4; i++) {
-            bool    is_odd = (i == odd_pod);
-            uint8_t r = is_odd ? colours[odd_idx].r
-                               : colours[maj_idx].r;
-            uint8_t g = is_odd ? colours[odd_idx].g
-                               : colours[maj_idx].g;
-            uint8_t b = is_odd ? colours[odd_idx].b
-                               : colours[maj_idx].b;
-
-            if (i == 0) {
-                /* nRF Pod 1 */
-                rgb_led_set_all(r, g, b, 0xFF);
+            if (!already) {
+                rgb_led_off();
                 k_mutex_lock(&state_mutex, K_FOREVER);
-                led_active     = true;
-                led_on_time_ms = round_start;
+                led_active = false;
+                if (mode == GAME_MODE_1) {
+                    round_ended = true;
+                }
                 k_mutex_unlock(&state_mutex);
-            } else {
-                /* ESP32 pods */
-                char cmd[16];
-                snprintf(cmd, sizeof(cmd),
-                         "ON:%02X%02X%02X", r, g, b);
-                write_to_pod(i - 1, cmd);
+
+                send_to_phone("POD1:TO\n");
+                request_beep(BEEP_LONG);
+
+                if (mode == GAME_MODE_1) {
+                    k_sem_give(&round_done_sem);
+                }
             }
+            prev_detected = false;
+            continue;
         }
 
-        send_to_phone("MODE2:ALL_ON\n");
+        bool detected = ir_sensor_detected();
 
-        /* Wait for result */
-        k_sem_take(&round_done_sem, K_MSEC(t_out + 2000));
+        if (!detected || prev_detected) {
+            prev_detected = detected;
+            continue;
+        }
+        prev_detected = detected;
 
-        /* Clean up */
-        turn_off_all_pods();
         k_mutex_lock(&state_mutex, K_FOREVER);
-        led_active = false;
+        bool        already = round_ended;
+        game_mode_t mode    = current_mode;
+        int         odd_pod = odd_pod_index;
         k_mutex_unlock(&state_mutex);
 
-        k_sleep(K_SECONDS(2));
+        if (already) continue;
+
+        if (mode == GAME_MODE_1) {
+            rgb_led_off();
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            led_active  = false;
+            round_ended = true;
+            k_mutex_unlock(&state_mutex);
+
+            char msg[24];
+            snprintf(msg, sizeof(msg), "POD1:RT:%d\n", (int32_t)elapsed);
+            send_to_phone(msg);
+            printk("%s", msg);
+            request_beep(BEEP_SHORT);
+            k_sem_give(&round_done_sem);
+
+        } else {
+            turn_off_all_pods();
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            led_active  = false;
+            round_ended = true;
+            k_mutex_unlock(&state_mutex);
+
+            if (odd_pod == 0) {
+                char msg[24];
+                snprintf(msg, sizeof(msg),
+                         "POD1:RT:%d\n", (int32_t)elapsed);
+                send_to_phone(msg);
+                printk("%s", msg);
+                request_beep(BEEP_SHORT);
+            } else {
+                send_to_phone("POD1:WRONG\n");
+                printk("POD1:WRONG\n");
+                request_beep(BEEP_LONG);
+            }
+            k_sem_give(&round_done_sem);
+        }
     }
 }
 
+/* ══════════════════════════════════════════════════════════
+ * Game thread
+ * ══════════════════════════════════════════════════════════ */
 static void game_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
@@ -759,30 +777,29 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
         k_sem_take(&game_start_sem, K_FOREVER);
 
         k_mutex_lock(&state_mutex, K_FOREVER);
-        game_mode_t mode = current_mode;
         bool        running = game_running;
+        game_mode_t mode    = current_mode;
+        uint32_t    tmo     = timeout_ms;
         k_mutex_unlock(&state_mutex);
 
         if (!running) continue;
 
-        printk("Starting mode %d\n", mode);
+        int available[4];
+        int count = build_available(available);
+
+        printk("Mode%d %d pods\n", mode, count);
 
         if (mode == GAME_MODE_1) {
-            /* Run one round of mode 1 then loop back
-             * so mode changes are picked up quickly */
             k_mutex_lock(&state_mutex, K_FOREVER);
-            bool    r_running = game_running;
             uint8_t r = game_r, g = game_g, b = game_b;
             k_mutex_unlock(&state_mutex);
-
-            if (!r_running) continue;
 
             k_mutex_lock(&state_mutex, K_FOREVER);
             round_ended = false;
             k_mutex_unlock(&state_mutex);
 
-            int pod = sys_rand32_get() % 4;
-            printk("Mode1: pod=%d\n", pod + 1);
+            int pod = available[sys_rand32_get() % count];
+            printk("M1:pod=%d\n", pod + 1);
 
             if (pod == 0) {
                 rgb_led_set_all(r, g, b, 0xFF);
@@ -793,74 +810,61 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
                 send_to_phone("POD1:ON\n");
             } else {
                 char cmd[16];
-                snprintf(cmd, sizeof(cmd),
-                         "ON:%02X%02X%02X", r, g, b);
+                snprintf(cmd, sizeof(cmd), "ON:%02X%02X%02X", r, g, b);
                 write_to_pod(pod - 1, cmd);
-                char notify[32];
-                snprintf(notify, sizeof(notify),
-                         "POD%d:ON\n", pod + 1);
+                k_sleep(K_MSEC(20));
+                char notify[20];
+                snprintf(notify, sizeof(notify), "POD%d:ON\n", pod + 1);
                 send_to_phone(notify);
             }
 
-            k_sem_take(&round_done_sem,
-                       K_MSEC(timeout_ms + 2000));
+            int sem_ret = k_sem_take(&round_done_sem, K_MSEC(tmo + 500));
 
-            /* Clean up */
             turn_off_all_pods();
             k_mutex_lock(&state_mutex, K_FOREVER);
             led_active = false;
+            round_ended = true;
             k_mutex_unlock(&state_mutex);
 
-            k_mutex_lock(&state_mutex, K_FOREVER);
-            bool still_running = game_running;
-            game_mode_t new_mode = current_mode;
-            k_mutex_unlock(&state_mutex);
-
-            if (!still_running) continue;
-
-            /* If mode changed, loop picks it up next iteration */
-            if (new_mode == GAME_MODE_1) {
-                k_sleep(K_SECONDS(2));
-                k_sem_give(&game_start_sem); /* keep going */
+            /* If nobody tapped in time, fire the long beep ourselves —
+             * don't rely solely on the ESP32 pod's own remote timeout
+             * notification, since with short timeouts that message can
+             * race the dongle's own deadline over the BLE link and
+             * never arrive before we already turn the pod off. */
+            if (sem_ret != 0) {
+                request_beep(BEEP_LONG);   /* ── FIX: dongle-driven Mode 1 timeout beep ── */
             }
-            /* if mode changed to 2, button ISR already gave
-             * game_start_sem so next iteration runs mode 2 */
 
         } else {
-            /* Run one round of mode 2 */
-            k_mutex_lock(&state_mutex, K_FOREVER);
-            bool     r_running = game_running;
-            uint32_t t_out     = timeout_ms;
-            k_mutex_unlock(&state_mutex);
+            int same_idx = sys_rand32_get() % NUM_COLOURS_M2;
+            int odd_idx  = random_m2_colour_excluding(same_idx);
+            int odd_pod  = available[sys_rand32_get() % count];
 
-            if (!r_running) continue;
-
-            int maj_idx = sys_rand32_get() % NUM_COLOURS;
-            int odd_idx = random_colour_excluding(maj_idx);
-            int odd_pod = sys_rand32_get() % 4;
-
-            printk("Mode2: maj=%s odd=%s odd_pod=%d\n",
-                   colours[maj_idx].name,
-                   colours[odd_idx].name,
+            printk("M2:same=%s odd=%s odd_pod=%d\n",
+                   colours_m2[same_idx].name,
+                   colours_m2[odd_idx].name,
                    odd_pod + 1);
 
             k_mutex_lock(&state_mutex, K_FOREVER);
             odd_pod_index = odd_pod;
             round_ended   = false;
             k_mutex_unlock(&state_mutex);
+            printk("M2 set: odd_pod=%d count=%d\n", odd_pod, count);
 
             int64_t round_start = k_uptime_get();
 
-            for (int i = 0; i < 4; i++) {
-                bool    is_odd = (i == odd_pod);
-                uint8_t r = is_odd ? colours[odd_idx].r
-                                   : colours[maj_idx].r;
-                uint8_t g = is_odd ? colours[odd_idx].g
-                                   : colours[maj_idx].g;
-                uint8_t b = is_odd ? colours[odd_idx].b
-                                   : colours[maj_idx].b;
+            for (int i = 0; i < count; i++) {
+                int  p      = available[i];
+                bool is_odd = (p == odd_pod);
 
-                if (i == 0) {
+                uint8_t r = is_odd ? colours_m2[odd_idx].r
+                                   : colours_m2[same_idx].r;
+                uint8_t g = is_odd ? colours_m2[odd_idx].g
+                                   : colours_m2[same_idx].g;
+                uint8_t b = is_odd ? colours_m2[odd_idx].b
+                                   : colours_m2[same_idx].b;
+
+                if (p == 0) {
                     rgb_led_set_all(r, g, b, 0xFF);
                     k_mutex_lock(&state_mutex, K_FOREVER);
                     led_active     = true;
@@ -870,36 +874,128 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
                     char cmd[16];
                     snprintf(cmd, sizeof(cmd),
                              "ON:%02X%02X%02X", r, g, b);
-                    write_to_pod(i - 1, cmd);
+                    write_to_pod(p - 1, cmd);
+                    k_sleep(K_MSEC(20));
                 }
             }
 
-            send_to_phone("MODE2:ALL_ON\n");
+            char notify[20];
+            snprintf(notify, sizeof(notify),
+                     "ODD:POD%d\n", odd_pod + 1);
+            send_to_phone(notify);
 
-            k_sem_take(&round_done_sem,
-                       K_MSEC(t_out + 2000));
+            int sem_ret = k_sem_take(&round_done_sem, K_MSEC(tmo));
 
             turn_off_all_pods();
             k_mutex_lock(&state_mutex, K_FOREVER);
-            led_active = false;
+            led_active  = false;
+            round_ended = true;
             k_mutex_unlock(&state_mutex);
 
-            k_mutex_lock(&state_mutex, K_FOREVER);
-            bool still_running   = game_running;
-            game_mode_t new_mode = current_mode;
-            k_mutex_unlock(&state_mutex);
-
-            if (!still_running) continue;
-
-            if (new_mode == GAME_MODE_2) {
-                k_sleep(K_SECONDS(2));
-                k_sem_give(&game_start_sem); /* keep going */
+            if (sem_ret != 0) {
+                send_to_phone("ROUND:TO\n");
+                request_beep(BEEP_LONG);
             }
-            /* if mode changed to 1, button ISR already gave
-             * game_start_sem so next iteration runs mode 1 */
+        }
+
+        k_sleep(K_SECONDS(1));
+
+        k_mutex_lock(&state_mutex, K_FOREVER);
+        bool still_running = game_running;
+        k_mutex_unlock(&state_mutex);
+
+        if (still_running) {
+            k_sem_give(&game_start_sem);
         }
     }
 }
+
+/* ══════════════════════════════════════════════════════════
+ * UART console thread
+ * ══════════════════════════════════════════════════════════ */
+static void uart_console_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    printk("UART console ready — type commands:\n");
+    printk("  START, STOP, RED, GREEN, BLUE, YELLOW, PINK, VIOLET, TIMEOUT:N\n");
+
+    while (true) {
+        char *line = console_getline();
+        if (!line) continue;
+
+        char cmd[32] = {0};
+        int j = 0;
+        for (int i = 0; line[i] && j < (int)(sizeof(cmd) - 1); i++) {
+            char c = line[i];
+            if (c == '\r' || c == '\n') break;
+            if (c >= 'a' && c <= 'z') c -= 32;
+            cmd[j++] = c;
+        }
+        cmd[j] = '\0';
+
+        if (cmd[0] == '\0') continue;
+
+        printk("Console cmd:[%s]\n", cmd);
+
+        if (strncmp(cmd, "TIMEOUT:", 8) == 0) {
+            int secs = atoi(cmd + 8);
+            if (secs >= 1 && secs <= 60) {
+                timeout_ms = (uint32_t)(secs * 1000);
+                printk("Timeout set to %ds\n", secs);
+            } else {
+                printk("TIMEOUT error (1-60)\n");
+            }
+            continue;
+        }
+
+        if (strcmp(cmd, "STOP") == 0) {
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            game_running = false;
+            led_active   = false;
+            k_mutex_unlock(&state_mutex);
+            turn_off_all_pods();
+            printk("Game STOPPED\n");
+            send_to_phone("STOPPED\n");
+            k_sem_give(&round_done_sem);
+            continue;
+        }
+
+        if (current_mode == GAME_MODE_1) {
+            if      (strcmp(cmd, "RED")    == 0) { game_r=0xFF; game_g=0x00; game_b=0x00; }
+            else if (strcmp(cmd, "GREEN")  == 0) { game_r=0x00; game_g=0xFF; game_b=0x00; }
+            else if (strcmp(cmd, "BLUE")   == 0) { game_r=0x00; game_g=0x00; game_b=0xFF; }
+            else if (strcmp(cmd, "YELLOW") == 0) { game_r=0xFF; game_g=0xFF; game_b=0x00; }
+            else if (strcmp(cmd, "PINK")   == 0) { game_r=0xFF; game_g=0x14; game_b=0x93; }
+            else if (strcmp(cmd, "VIOLET") == 0) { game_r=0x94; game_g=0x00; game_b=0xD3; }
+            else if (strcmp(cmd, "START")  == 0) { /* use current colour */ }
+            else { printk("Unknown command\n"); continue; }
+
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            game_running = true;
+            k_mutex_unlock(&state_mutex);
+            k_sem_give(&game_start_sem);
+            printk("Mode 1 GO (R=%02X G=%02X B=%02X)\n", game_r, game_g, game_b);
+            send_to_phone("M1:GO\n");
+            continue;
+        }
+
+        if (current_mode == GAME_MODE_2) {
+            if (strcmp(cmd, "START") == 0) {
+                k_mutex_lock(&state_mutex, K_FOREVER);
+                game_running = true;
+                k_mutex_unlock(&state_mutex);
+                k_sem_give(&game_start_sem);
+                printk("Mode 2 GO\n");
+                send_to_phone("M2:GO\n");
+            } else {
+                printk("Unknown command\n");
+            }
+            continue;
+        }
+    }
+}
+
 /* ══════════════════════════════════════════════════════════
  * main()
  * ══════════════════════════════════════════════════════════ */
@@ -907,59 +1003,48 @@ int main(void)
 {
     int err;
 
-    printk("Blazepod1 starting...\n");
-    
+    printk("Blazepod1 starting\n");
 
-/* ── GPIO mode button init ── */
-if (!gpio_is_ready_dt(&mode_btn)) {
-    printk("Mode button GPIO not ready\n");
-    return 0;
-}
-
-int btn_err = gpio_pin_configure_dt(&mode_btn, GPIO_INPUT);
-if (btn_err) {
-    printk("Button configure failed err=%d\n", btn_err);
-    return 0;
-}
-
-btn_err = gpio_pin_interrupt_configure_dt(&mode_btn,
-                                          GPIO_INT_EDGE_TO_ACTIVE);
-if (btn_err) {
-    printk("Button interrupt configure failed err=%d\n", btn_err);
-    return 0;
-}
-
-gpio_init_callback(&button_cb_data, button_pressed,
-                   BIT(mode_btn.pin));
-gpio_add_callback(mode_btn.port, &button_cb_data);
-printk("Mode button ready pin=%d\n", mode_btn.pin);
-
-    if (rgb_led_init() != 0) {
-        printk("LED init failed\n");
+    if (!gpio_is_ready_dt(&mode_btn)) {
+        printk("Mode btn not ready\n");
         return 0;
     }
+    gpio_pin_configure_dt(&mode_btn, GPIO_INPUT);
+    gpio_pin_interrupt_configure_dt(&mode_btn, GPIO_INT_EDGE_TO_ACTIVE);
+    gpio_init_callback(&button_cb_data, button_pressed,
+                       BIT(mode_btn.pin));
+    gpio_add_callback(mode_btn.port, &button_cb_data);
+    printk("Mode btn ready pin=%d\n", mode_btn.pin);
+
+    if (rgb_led_init() != 0) { printk("LED failed\n"); return 0; }
     rgb_led_off();
 
-    if (ir_sensor_init() != 0) {
-        printk("IR init failed\n");
-        return 0;
-    }
+    if (ir_sensor_init() != 0) { printk("IR failed\n"); return 0; }
+
+    if (buzzer_init() != 0) { printk("Buzzer failed\n"); return 0; }
 
     memset(pods, 0, sizeof(pods));
+    last_connecting_pod = -1;
 
-    /* IR thread */
     k_thread_create(&ir_thread_data, ir_stack,
                     K_THREAD_STACK_SIZEOF(ir_stack),
                     ir_thread_fn, NULL, NULL, NULL,
                     IR_THREAD_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&ir_thread_data, "ir_pod1");
 
-    /* Game thread */
     k_thread_create(&game_thread_data, game_stack,
                     K_THREAD_STACK_SIZEOF(game_stack),
                     game_thread_fn, NULL, NULL, NULL,
                     GAME_THREAD_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&game_thread_data, "game");
+
+    k_thread_create(&buzz_thread_data, buzz_stack,
+                    K_THREAD_STACK_SIZEOF(buzz_stack),
+                    buzz_thread_fn, NULL, NULL, NULL,
+                    BUZZ_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&buzz_thread_data, "buzzer");
+
+    console_getline_init();
 
     bt_conn_cb_register(&conn_callbacks);
 
@@ -969,22 +1054,25 @@ printk("Mode button ready pin=%d\n", mode_btn.pin);
     err = bt_enable(NULL);
     if (err) return err;
 
-    /* Advertise to phone */
     bt_le_adv_stop();
     bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
                     sd, ARRAY_SIZE(sd));
-    printk("Advertising as Blazepod1\n");
+    printk("Advertising\n");
 
-    /* Scan for ESP32 pods */
     start_scan();
 
-    /* Main loop — restarts advertising after phone disconnects */
+    k_thread_create(&uart_thread_data, uart_stack,
+                    K_THREAD_STACK_SIZEOF(uart_stack),
+                    uart_console_thread_fn, NULL, NULL, NULL,
+                    UART_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&uart_thread_data, "uart_cmd");
+
     while (true) {
         k_sem_take(&adv_sem, K_FOREVER);
         bt_le_adv_stop();
         bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
                         sd, ARRAY_SIZE(sd));
-        printk("Advertising restarted\n");
+        printk("Adv restarted\n");
     }
 
     return 0;

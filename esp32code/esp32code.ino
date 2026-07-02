@@ -7,8 +7,8 @@
 #include "soc/rtc_cntl_reg.h"
 
 /* ── Pod identity — CHANGE THIS per ESP32 ───────────────── */
-#define POD_NUMBER   3
-#define POD_NAME     "Blazepod3"
+#define POD_NUMBER   4
+#define POD_NAME     "Blazepod4"
 
 /* ── Pin config ─────────────────────────────────────────── */
 #define LED_PIN      16

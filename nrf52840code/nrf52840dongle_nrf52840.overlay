@@ -1,0 +1,74 @@
+#include <zephyr/dt-bindings/led/led.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+#define SPI_FREQ    4000000
+#define ONE_FRAME   0x70
+#define ZERO_FRAME  0x40
+
+&spi1 {
+    compatible = "nordic,nrf-spim";
+    status = "okay";
+    pinctrl-0 = <&spi1_default>;
+    pinctrl-1 = <&spi1_sleep>;
+    pinctrl-names = "default", "sleep";
+
+    led_strip: ws2812@0 {
+        compatible = "worldsemi,ws2812-spi";
+        reg = <0>;
+        spi-max-frequency = <SPI_FREQ>;
+        chain-length = <16>;
+        color-mapping = <LED_COLOR_ID_GREEN
+                         LED_COLOR_ID_RED
+                         LED_COLOR_ID_BLUE>;
+        spi-one-frame = <ONE_FRAME>;
+        spi-zero-frame = <ZERO_FRAME>;
+    };
+};
+
+&pinctrl {
+    spi1_default: spi1_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 0, 31)>,
+                    <NRF_PSEL(SPIM_MOSI, 0, 17)>,
+                    <NRF_PSEL(SPIM_MISO, 1, 13)>;
+        };
+    };
+
+    spi1_sleep: spi1_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_SCK, 0, 31)>,
+                    <NRF_PSEL(SPIM_MOSI, 0, 17)>,
+                    <NRF_PSEL(SPIM_MISO, 1, 13)>;
+            low-power-enable;
+        };
+    };
+};
+
+/ {
+    aliases {
+        led-strip = &led_strip;
+        ir-sensor = &ir_sensor;
+        mode-switch = &mode_switch_node;
+    };
+
+    ir {
+        compatible = "gpio-keys";
+        status = "okay";
+
+        ir_sensor: ir_sensor {
+            gpios = <&gpio0 13 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "IR Proximity Sensor";
+        };
+    };
+
+    mode_sw {
+        compatible = "gpio-keys";
+        status = "okay";
+
+        mode_switch_node: mode_switch {
+            gpios = <&gpio0 24 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+            label = "Mode Switch";
+        };
+    };
+
+    };
