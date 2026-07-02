@@ -49,7 +49,7 @@ static pod_t pods[NUM_ESP32_PODS];
 /* ── Thread config ──────────────────────────────────────── */
 #define IR_THREAD_STACK_SIZE    2048
 #define IR_THREAD_PRIORITY      5
-#define IR_POLL_INTERVAL_MS     50
+
 #define GAME_THREAD_STACK_SIZE  2048
 #define GAME_THREAD_PRIORITY    6
 #define UART_THREAD_STACK_SIZE  2048
@@ -102,6 +102,7 @@ static struct gpio_callback button_cb_data;
 static K_SEM_DEFINE(adv_sem,        0, 1);
 static K_SEM_DEFINE(game_start_sem, 0, 1);
 static K_SEM_DEFINE(round_done_sem, 0, 1);
+static K_SEM_DEFINE(ir_detect_sem,  0, 1);
 
 /* ── Shared state ───────────────────────────────────────── */
 static K_MUTEX_DEFINE(state_mutex);
@@ -663,30 +664,74 @@ static void button_pressed(const struct device *dev,
 }
 
 /* ══════════════════════════════════════════════════════════
- * IR thread
+ * IR thread  (interrupt-driven)
+ *
+ * The IR GPIO ISR gives ir_detect_sem on the active edge.
+ * This thread waits either for that semaphore or for the
+ * round timeout — whichever comes first.
  * ══════════════════════════════════════════════════════════ */
 static void ir_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    bool prev_detected = false;
-
     while (true) {
-        k_sleep(K_MSEC(IR_POLL_INTERVAL_MS));
-
+        /* ── Wait until the local LED is actually on ────── */
         k_mutex_lock(&state_mutex, K_FOREVER);
         bool    is_active = led_active;
         int64_t start     = led_on_time_ms;
         k_mutex_unlock(&state_mutex);
 
         if (!is_active) {
-            prev_detected = false;
+            /* Nothing to watch — sleep briefly and re-check.
+             * The interrupt is disabled while the LED is off. */
+            k_sleep(K_MSEC(50));
             continue;
         }
 
-        int64_t elapsed = k_uptime_get() - start;
+        /* ── Compute how much time remains ─────────────── */
+        int64_t elapsed   = k_uptime_get() - start;
+        int64_t remaining = (int64_t)timeout_ms - elapsed;
 
-        if (elapsed >= timeout_ms) {
+        if (remaining <= 0) {
+            /* Already timed out — handle it */
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            bool        already = round_ended;
+            game_mode_t mode    = current_mode;
+            k_mutex_unlock(&state_mutex);
+
+            if (!already) {
+                ir_sensor_int_disable();
+                rgb_led_off();
+                k_mutex_lock(&state_mutex, K_FOREVER);
+                led_active = false;
+                if (mode == GAME_MODE_1) {
+                    round_ended = true;
+                }
+                k_mutex_unlock(&state_mutex);
+
+                send_to_phone("POD1:TO\n");
+                request_beep(BEEP_LONG);
+
+                if (mode == GAME_MODE_1) {
+                    k_sem_give(&round_done_sem);
+                }
+            }
+            continue;
+        }
+
+        /* ── Drain any stale gives, then enable the IRQ ── */
+        while (k_sem_take(&ir_detect_sem, K_NO_WAIT) == 0) {
+            /* discard */
+        }
+        ir_sensor_int_enable();
+
+        /* ── Block until detection or timeout ─────────── */
+        int ret = k_sem_take(&ir_detect_sem, K_MSEC(remaining));
+
+        ir_sensor_int_disable();
+
+        if (ret != 0) {
+            /* Timeout — no detection within the window */
             k_mutex_lock(&state_mutex, K_FOREVER);
             bool        already = round_ended;
             game_mode_t mode    = current_mode;
@@ -708,17 +753,11 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
                     k_sem_give(&round_done_sem);
                 }
             }
-            prev_detected = false;
             continue;
         }
 
-        bool detected = ir_sensor_detected();
-
-        if (!detected || prev_detected) {
-            prev_detected = detected;
-            continue;
-        }
-        prev_detected = detected;
+        /* ── IR detected! ─────────────────────────────── */
+        elapsed = k_uptime_get() - start;
 
         k_mutex_lock(&state_mutex, K_FOREVER);
         bool        already = round_ended;
@@ -1020,6 +1059,10 @@ int main(void)
     rgb_led_off();
 
     if (ir_sensor_init() != 0) { printk("IR failed\n"); return 0; }
+    if (ir_sensor_init_interrupt(&ir_detect_sem) != 0) {
+        printk("IR interrupt setup failed\n"); return 0;
+    }
+    ir_sensor_int_disable();  /* disabled until a round starts */
 
     if (buzzer_init() != 0) { printk("Buzzer failed\n"); return 0; }
 
