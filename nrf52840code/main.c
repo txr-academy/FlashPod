@@ -56,22 +56,27 @@ static pod_t pods[NUM_ESP32_PODS];
 #define UART_THREAD_PRIORITY    7
 #define BUZZ_THREAD_STACK_SIZE  512
 #define BUZZ_THREAD_PRIORITY    8
+#define MODE_THREAD_STACK_SIZE  1024
+#define MODE_THREAD_PRIORITY    6
 
 K_THREAD_STACK_DEFINE(ir_stack,   IR_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(game_stack, GAME_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(uart_stack, UART_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(buzz_stack, BUZZ_THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(mode_stack, MODE_THREAD_STACK_SIZE);
 
 static struct k_thread ir_thread_data;
 static struct k_thread game_thread_data;
 static struct k_thread uart_thread_data;
 static struct k_thread buzz_thread_data;
+static struct k_thread mode_thread_data;
 
 /* ── Buzzer message queue ───────────────────────────────── */
 typedef enum {
-    BEEP_NONE  = 0,
-    BEEP_SHORT = 1,
-    BEEP_LONG  = 2,
+    BEEP_NONE   = 0,
+    BEEP_SHORT  = 1,
+    BEEP_LONG   = 2,
+    BEEP_DOUBLE = 3,
 } beep_type_t;
 
 K_MSGQ_DEFINE(buzz_msgq, sizeof(beep_type_t), 4, 1);
@@ -87,7 +92,8 @@ static uint32_t timeout_ms = 10000U;
 /* ── Game mode ──────────────────────────────────────────── */
 typedef enum {
     GAME_MODE_1 = 1,
-    GAME_MODE_2 = 2
+    GAME_MODE_2 = 2,
+    GAME_MODE_3 = 3
 } game_mode_t;
 
 static game_mode_t current_mode = GAME_MODE_1;
@@ -102,6 +108,7 @@ static struct gpio_callback button_cb_data;
 static K_SEM_DEFINE(adv_sem,        0, 1);
 static K_SEM_DEFINE(game_start_sem, 0, 1);
 static K_SEM_DEFINE(round_done_sem, 0, 1);
+static K_SEM_DEFINE(mode_switch_sem, 0, 1);
 
 /* ── Shared state ───────────────────────────────────────── */
 static K_MUTEX_DEFINE(state_mutex);
@@ -113,10 +120,21 @@ static bool            notif_enabled  = false;
 static bool            round_ended    = false;
 static int             odd_pod_index  = -1;
 
+/* ── Mode 3 (memory) state ──────────────────────────────── */
+static int  mode3_sequence[4];      /* order of available[]-style pod ids */
+static int  mode3_seq_len     = 0;
+static int  mode3_expected_idx = 0; /* index of next pod the user must tap */
+static bool mode3_awaiting_tap = false; /* true while waiting for taps */
+
 /* ── Game colour (Mode 1) ───────────────────────────────── */
 static uint8_t game_r = 0xFF;
 static uint8_t game_g = 0x00;
 static uint8_t game_b = 0x00;
+
+/* ── Game colour (Mode 3) — default YELLOW ─────────────── */
+static uint8_t game3_r = 0xFF;
+static uint8_t game3_g = 0xFF;
+static uint8_t game3_b = 0x00;
 
 /* ── Colour tables ──────────────────────────────────────── */
 typedef struct {
@@ -147,11 +165,13 @@ static const struct bt_data sd[] = {
 static void send_to_phone(const char *msg);
 static void ir_thread_fn(void *p1, void *p2, void *p3);
 static void game_thread_fn(void *p1, void *p2, void *p3);
+static void mode_switch_thread_fn(void *p1, void *p2, void *p3);
 static void uart_console_thread_fn(void *p1, void *p2, void *p3);
 static void buzz_thread_fn(void *p1, void *p2, void *p3);
 static void start_scan(void);
 static void write_to_pod(int pod_idx, const char *cmd);
 static void turn_off_all_pods(void);
+static void handle_mode3_tap(int tapped_avail_idx);
 
 /* ══════════════════════════════════════════════════════════
  * Buzzer thread
@@ -169,6 +189,11 @@ static void buzz_thread_fn(void *p1, void *p2, void *p3)
             break;
         case BEEP_LONG:
             buzzer_beep_long();
+            break;
+        case BEEP_DOUBLE:
+            buzzer_beep_short();
+            k_sleep(K_MSEC(150));
+            buzzer_beep_short();
             break;
         default:
             break;
@@ -211,6 +236,66 @@ static void turn_off_all_pods(void)
     rgb_led_off();
     for (int i = 0; i < NUM_ESP32_PODS; i++) {
         write_to_pod(i, "OFF");
+        k_sleep(K_MSEC(20));
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
+ * Mode 3 (memory) — judge a single tap against the expected
+ * next pod in the sequence. Called with tapped_avail_idx in
+ * the same 0..3 encoding used by available[] (0=local pod1,
+ * 1/2/3 = pod2/pod3/pod4).
+ * ══════════════════════════════════════════════════════════ */
+static void handle_mode3_tap(int tapped_avail_idx)
+{
+    k_mutex_lock(&state_mutex, K_FOREVER);
+    bool already      = round_ended;
+    int  expected_idx = mode3_expected_idx;
+    int  seq_len       = mode3_seq_len;
+    int  expected_pod  = (expected_idx < seq_len) ?
+                          mode3_sequence[expected_idx] : -1;
+    k_mutex_unlock(&state_mutex);
+
+    if (already || expected_pod < 0) return;
+
+    if (tapped_avail_idx == expected_pod) {
+        expected_idx++;
+
+        if (expected_idx >= seq_len) {
+            /* Full sequence tapped correctly — round won */
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            round_ended        = true;
+            mode3_awaiting_tap = false;
+            mode3_expected_idx = expected_idx;
+            k_mutex_unlock(&state_mutex);
+
+            printk("M3:CORRECT\n");
+            send_to_phone("MEM:CORRECT\n");
+            request_beep(BEEP_SHORT);
+            k_sem_give(&round_done_sem);
+        } else {
+            /* Correct so far, still waiting on more taps */
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            mode3_expected_idx = expected_idx;
+            k_mutex_unlock(&state_mutex);
+
+            char msg[16];
+            snprintf(msg, sizeof(msg), "MEM:OK:%d\n", expected_idx);
+            printk("M3:OK:%d/%d\n", expected_idx, seq_len);
+            send_to_phone(msg);
+            request_beep(BEEP_SHORT);
+        }
+    } else {
+        /* Wrong pod tapped — round over */
+        k_mutex_lock(&state_mutex, K_FOREVER);
+        round_ended        = true;
+        mode3_awaiting_tap = false;
+        k_mutex_unlock(&state_mutex);
+
+        printk("M3:WRONG\n");
+        send_to_phone("MEM:WRONG\n");
+        request_beep(BEEP_DOUBLE);
+        k_sem_give(&round_done_sem);
     }
 }
 
@@ -283,8 +368,9 @@ static void received_from_phone(struct bt_conn *conn, const void *data,
 
     if (strcmp(msg, "STOP") == 0) {
         k_mutex_lock(&state_mutex, K_FOREVER);
-        game_running = false;
-        led_active   = false;
+        game_running       = false;
+        led_active         = false;
+        mode3_awaiting_tap = false;
         k_mutex_unlock(&state_mutex);
         turn_off_all_pods();
         send_to_phone("STOPPED\n");
@@ -320,6 +406,24 @@ static void received_from_phone(struct bt_conn *conn, const void *data,
         } else {
             send_to_phone("UNKNOWN\n");
         }
+        return;
+    }
+
+    if (current_mode == GAME_MODE_3) {
+        if      (strcmp(msg, "RED")    == 0) { game3_r=0xFF; game3_g=0x00; game3_b=0x00; }
+        else if (strcmp(msg, "GREEN")  == 0) { game3_r=0x00; game3_g=0xFF; game3_b=0x00; }
+        else if (strcmp(msg, "BLUE")   == 0) { game3_r=0x00; game3_g=0x00; game3_b=0xFF; }
+        else if (strcmp(msg, "YELLOW") == 0) { game3_r=0xFF; game3_g=0xFF; game3_b=0x00; }
+        else if (strcmp(msg, "PINK")   == 0) { game3_r=0xFF; game3_g=0x14; game3_b=0x93; }
+        else if (strcmp(msg, "VIOLET") == 0) { game3_r=0x94; game3_g=0x00; game3_b=0xD3; }
+        else if (strcmp(msg, "START")  == 0) { /* use current colour */ }
+        else { send_to_phone("UNKNOWN\n"); return; }
+
+        k_mutex_lock(&state_mutex, K_FOREVER);
+        game_running = true;
+        k_mutex_unlock(&state_mutex);
+        k_sem_give(&game_start_sem);
+        send_to_phone("M3:GO\n");
         return;
     }
 }
@@ -392,6 +496,11 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
         char fwd[68];
         snprintf(fwd, sizeof(fwd), "%s\n", msg);
         send_to_phone(fwd);
+        return BT_GATT_ITER_CONTINUE;
+    }
+
+    if (mode == GAME_MODE_3) {
+        handle_mode3_tap(tapped_avail_idx);
         return BT_GATT_ITER_CONTINUE;
     }
 
@@ -608,11 +717,16 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
             bt_conn_unref(phone_conn);
             phone_conn    = NULL;
         }
-        game_running  = false;
-        led_active    = false;
-        notif_enabled = false;
+        game_running       = false;
+        led_active         = false;
+        notif_enabled      = false;
+        round_ended        = true;
+        mode3_awaiting_tap = false;
         k_mutex_unlock(&state_mutex);
         turn_off_all_pods();
+        k_sem_give(&round_done_sem);   /* unblock game_thread immediately
+                                         * instead of leaving it waiting
+                                         * out a Mode 3 tap timeout */
         k_sem_give(&adv_sem);
     }
 }
@@ -623,7 +737,13 @@ static struct bt_conn_cb conn_callbacks = {
 };
 
 /* ══════════════════════════════════════════════════════════
- * Mode switch button callback
+ * Mode switch button — ISR + worker thread
+ *
+ * The GPIO callback runs in interrupt context on this platform,
+ * where blocking calls (k_mutex_lock, k_sleep, BLE sends, GATT
+ * writes) are illegal and will fault the firmware. So the ISR
+ * itself only checks the pin and gives an ISR-safe semaphore;
+ * a dedicated thread does all the actual (blocking) work.
  * ══════════════════════════════════════════════════════════ */
 static void button_pressed(const struct device *dev,
                             struct gpio_callback *cb,
@@ -637,28 +757,44 @@ static void button_pressed(const struct device *dev,
         return;
     }
 
-    if (current_mode == GAME_MODE_1) {
-        current_mode = GAME_MODE_2;
-        printk("MODE 2\n");
-        send_to_phone("MODE:2\n");
-    } else {
-        current_mode = GAME_MODE_1;
-        printk("MODE 1\n");
-        send_to_phone("MODE:1\n");
-    }
+    k_sem_give(&mode_switch_sem);   /* ISR-safe — no blocking here */
+}
 
-    k_mutex_lock(&state_mutex, K_FOREVER);
-    bool running = game_running;
-    k_mutex_unlock(&state_mutex);
+static void mode_switch_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    if (running) {
-        turn_off_all_pods();
+    while (true) {
+        k_sem_take(&mode_switch_sem, K_FOREVER);
+
+        if (current_mode == GAME_MODE_1) {
+            current_mode = GAME_MODE_2;
+            printk("MODE 2\n");
+            send_to_phone("MODE:2\n");
+        } else if (current_mode == GAME_MODE_2) {
+            current_mode = GAME_MODE_3;
+            printk("MODE 3\n");
+            send_to_phone("MODE:3\n");
+        } else {
+            current_mode = GAME_MODE_1;
+            printk("MODE 1\n");
+            send_to_phone("MODE:1\n");
+        }
+
         k_mutex_lock(&state_mutex, K_FOREVER);
-        led_active  = false;
-        round_ended = true;
+        bool running = game_running;
         k_mutex_unlock(&state_mutex);
-        k_sem_give(&round_done_sem);
-        k_sem_give(&game_start_sem);
+
+        if (running) {
+            turn_off_all_pods();
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            led_active         = false;
+            round_ended        = true;
+            mode3_awaiting_tap = false;
+            k_mutex_unlock(&state_mutex);
+            k_sem_give(&round_done_sem);
+            k_sem_give(&game_start_sem);
+        }
     }
 }
 
@@ -675,18 +811,19 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
         k_sleep(K_MSEC(IR_POLL_INTERVAL_MS));
 
         k_mutex_lock(&state_mutex, K_FOREVER);
-        bool    is_active = led_active;
-        int64_t start     = led_on_time_ms;
+        bool    is_active   = led_active;
+        int64_t start       = led_on_time_ms;
+        bool    waiting_m3  = mode3_awaiting_tap;
         k_mutex_unlock(&state_mutex);
 
-        if (!is_active) {
+        if (!is_active && !waiting_m3) {
             prev_detected = false;
             continue;
         }
 
-        int64_t elapsed = k_uptime_get() - start;
+        int64_t elapsed = is_active ? (k_uptime_get() - start) : 0;
 
-        if (elapsed >= timeout_ms) {
+        if (is_active && elapsed >= timeout_ms) {
             k_mutex_lock(&state_mutex, K_FOREVER);
             bool        already = round_ended;
             game_mode_t mode    = current_mode;
@@ -742,7 +879,7 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
             request_beep(BEEP_SHORT);
             k_sem_give(&round_done_sem);
 
-        } else {
+        } else if (mode == GAME_MODE_2) {
             turn_off_all_pods();
             k_mutex_lock(&state_mutex, K_FOREVER);
             led_active  = false;
@@ -762,6 +899,9 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
                 request_beep(BEEP_LONG);
             }
             k_sem_give(&round_done_sem);
+
+        } else if (mode == GAME_MODE_3) {
+            handle_mode3_tap(0);
         }
     }
 }
@@ -838,7 +978,7 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
                 request_beep(BEEP_LONG);   /* ── FIX: dongle-driven Mode 1 timeout beep ── */
             }
 
-        } else {
+        } else if (mode == GAME_MODE_2) {
             int same_idx = sys_rand32_get() % NUM_COLOURS_M2;
             int odd_idx  = random_m2_colour_excluding(same_idx);
             int odd_pod  = available[sys_rand32_get() % count];
@@ -903,6 +1043,114 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
                 send_to_phone("ROUND:TO\n");
                 request_beep(BEEP_LONG);
             }
+
+        } else if (mode == GAME_MODE_3) {
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            uint8_t r3 = game3_r, g3 = game3_g, b3 = game3_b;
+            k_mutex_unlock(&state_mutex);
+
+            /* Shuffle the available pods into a random display order */
+            int seq[4];
+            memcpy(seq, available, sizeof(int) * count);
+            for (int i = count - 1; i > 0; i--) {
+                int j   = sys_rand32_get() % (i + 1);
+                int tmp = seq[i];
+                seq[i]  = seq[j];
+                seq[j]  = tmp;
+            }
+
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            memcpy(mode3_sequence, seq, sizeof(int) * count);
+            mode3_seq_len       = count;
+            mode3_expected_idx  = 0;
+            mode3_awaiting_tap  = false;
+            round_ended         = false;
+            k_mutex_unlock(&state_mutex);
+
+            /* Drain any stale semaphore gives from previous rounds */
+            while (k_sem_take(&round_done_sem, K_NO_WAIT) == 0) {}
+
+            printk("M3 set: seq_len=%d\n", count);
+            printk("M3: order:");
+            for (int i = 0; i < count; i++) printk(" pod%d", seq[i] + 1);
+            printk("\n");
+
+            send_to_phone("MEM:SHOW\n");
+
+            /* Playback phase — light each pod for 1s with a short gap.
+             * Re-checked each iteration so STOP / mode switch can
+             * abort mid-sequence instead of running to completion. */
+            bool aborted = false;
+            for (int i = 0; i < count; i++) {
+                k_mutex_lock(&state_mutex, K_FOREVER);
+                bool stop_req = !game_running;
+                k_mutex_unlock(&state_mutex);
+                if (stop_req) { aborted = true; break; }
+
+                int p = seq[i];
+                if (p == 0) {
+                    rgb_led_set_all(r3, g3, b3, 0xFF);
+                } else {
+                    char cmd[16];
+                    snprintf(cmd, sizeof(cmd),
+                             "ON:%02X%02X%02X", r3, g3, b3);
+                    write_to_pod(p - 1, cmd);
+                }
+
+                k_sleep(K_MSEC(1000));
+
+                if (p == 0) {
+                    rgb_led_off();
+                } else {
+                    write_to_pod(p - 1, "OFF");
+                }
+
+                k_sleep(K_MSEC(300));
+            }
+
+            if (!aborted) {
+                /* Arm every connected ESP32 pod so its IR sensor keeps
+                 * being polled even though its LED is now off — without
+                 * this, the pods never look at their sensor at all
+                 * during the input phase. The local pod doesn't need a
+                 * BLE command; ir_thread_fn already watches
+                 * mode3_awaiting_tap directly. */
+                for (int i = 0; i < NUM_ESP32_PODS; i++) {
+                    if (pods[i].connected && pods[i].handles_found) {
+                        write_to_pod(i, "ARM");
+                        k_sleep(K_MSEC(20));
+                    }
+                }
+
+                k_mutex_lock(&state_mutex, K_FOREVER);
+                mode3_awaiting_tap = true;
+                k_mutex_unlock(&state_mutex);
+
+                send_to_phone("MEM:GO\n");
+
+                /* Single overall timeout for the whole input phase —
+                 * uses the same TIMEOUT dial as Modes 1/2, not
+                 * multiplied by the number of pods in the sequence. */
+                int sem_ret = k_sem_take(&round_done_sem, K_MSEC(tmo));
+
+                k_mutex_lock(&state_mutex, K_FOREVER);
+                mode3_awaiting_tap = false;
+                round_ended        = true;
+                k_mutex_unlock(&state_mutex);
+
+                turn_off_all_pods();   /* also DISARMs every pod */
+
+                if (sem_ret != 0) {
+                    send_to_phone("MEM:TO\n");
+                    printk("M3:TIMEOUT\n");
+                    request_beep(BEEP_DOUBLE);
+                }
+            } else {
+                k_mutex_lock(&state_mutex, K_FOREVER);
+                round_ended = true;
+                k_mutex_unlock(&state_mutex);
+                turn_off_all_pods();
+            }
         }
 
         k_sleep(K_SECONDS(1));
@@ -926,6 +1174,7 @@ static void uart_console_thread_fn(void *p1, void *p2, void *p3)
 
     printk("UART console ready — type commands:\n");
     printk("  START, STOP, RED, GREEN, BLUE, YELLOW, PINK, VIOLET, TIMEOUT:N\n");
+    printk("  (Mode 3 memory game: pick a colour or START, default YELLOW)\n");
 
     while (true) {
         char *line = console_getline();
@@ -958,8 +1207,9 @@ static void uart_console_thread_fn(void *p1, void *p2, void *p3)
 
         if (strcmp(cmd, "STOP") == 0) {
             k_mutex_lock(&state_mutex, K_FOREVER);
-            game_running = false;
-            led_active   = false;
+            game_running       = false;
+            led_active         = false;
+            mode3_awaiting_tap = false;
             k_mutex_unlock(&state_mutex);
             turn_off_all_pods();
             printk("Game STOPPED\n");
@@ -998,6 +1248,26 @@ static void uart_console_thread_fn(void *p1, void *p2, void *p3)
             } else {
                 printk("Unknown command\n");
             }
+            continue;
+        }
+
+        if (current_mode == GAME_MODE_3) {
+            if      (strcmp(cmd, "RED")    == 0) { game3_r=0xFF; game3_g=0x00; game3_b=0x00; }
+            else if (strcmp(cmd, "GREEN")  == 0) { game3_r=0x00; game3_g=0xFF; game3_b=0x00; }
+            else if (strcmp(cmd, "BLUE")   == 0) { game3_r=0x00; game3_g=0x00; game3_b=0xFF; }
+            else if (strcmp(cmd, "YELLOW") == 0) { game3_r=0xFF; game3_g=0xFF; game3_b=0x00; }
+            else if (strcmp(cmd, "PINK")   == 0) { game3_r=0xFF; game3_g=0x14; game3_b=0x93; }
+            else if (strcmp(cmd, "VIOLET") == 0) { game3_r=0x94; game3_g=0x00; game3_b=0xD3; }
+            else if (strcmp(cmd, "START")  == 0) { /* use current colour */ }
+            else { printk("Unknown command\n"); continue; }
+
+            k_mutex_lock(&state_mutex, K_FOREVER);
+            game_running = true;
+            k_mutex_unlock(&state_mutex);
+            k_sem_give(&game_start_sem);
+            printk("Mode 3 GO (R=%02X G=%02X B=%02X)\n",
+                   game3_r, game3_g, game3_b);
+            send_to_phone("M3:GO\n");
             continue;
         }
     }
@@ -1050,6 +1320,12 @@ int main(void)
                     buzz_thread_fn, NULL, NULL, NULL,
                     BUZZ_THREAD_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&buzz_thread_data, "buzzer");
+
+    k_thread_create(&mode_thread_data, mode_stack,
+                    K_THREAD_STACK_SIZEOF(mode_stack),
+                    mode_switch_thread_fn, NULL, NULL, NULL,
+                    MODE_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&mode_thread_data, "mode_switch");
 
     console_getline_init();
 
