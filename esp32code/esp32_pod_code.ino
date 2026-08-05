@@ -7,8 +7,8 @@
 #include "soc/rtc_cntl_reg.h"
 
 /* ── Pod identity — CHANGE THIS per ESP32 ───────────────── */
-#define POD_NUMBER   4
-#define POD_NAME     "Blazepod4"
+#define POD_NUMBER   2
+#define POD_NAME     "Blazepod2"
 
 /* ── Pin config ─────────────────────────────────────────── */
 #define LED_PIN      16
@@ -34,6 +34,12 @@ static portMUX_TYPE   stateMux    = portMUX_INITIALIZER_UNLOCKED;
 static bool           ledActive   = false;
 static unsigned long  ledOnTimeMs = 0;
 static unsigned long  timeoutMs   = 10000;  /* default 10s, updated by nRF */
+
+/* Mode 3 (memory game) — "armed" means: keep polling the IR sensor
+ * and report a tap even though the LED is currently OFF. This is
+ * separate from ledActive, which only covers Modes 1/2 where the
+ * pod is lit the whole time it's waiting for a tap. */
+static bool           armed       = false;
 
 /* ── IR task handle ─────────────────────────────────────── */
 static TaskHandle_t irTaskHandle = nullptr;
@@ -82,6 +88,7 @@ class ServerCallbacks : public BLEServerCallbacks
 
         portENTER_CRITICAL(&stateMux);
         ledActive = false;
+        armed     = false;
         portEXIT_CRITICAL(&stateMux);
 
         ledOff();
@@ -96,7 +103,11 @@ class ServerCallbacks : public BLEServerCallbacks
  *
  * Commands:
  *   ON:RRGGBB      → turn LED on with hex colour
- *   OFF            → turn LED off
+ *   OFF            → turn LED off (and stop listening)
+ *   ARM            → keep LED state as-is, but start polling the
+ *                     IR sensor for a tap even though the LED is off
+ *                     (used by Mode 3's input phase)
+ *   DISARM         → stop listening without touching the LED
  *   TIMEOUT:xxxxx  → set timeout in milliseconds
  * ══════════════════════════════════════════════════════════ */
 class RxCallbacks : public BLECharacteristicCallbacks
@@ -127,6 +138,7 @@ class RxCallbacks : public BLECharacteristicCallbacks
             portENTER_CRITICAL(&stateMux);
             ledActive   = true;
             ledOnTimeMs = millis();
+            armed       = false;   /* lit-state detection takes over */
             portEXIT_CRITICAL(&stateMux);
 
             Serial.printf("LED ON r=%d g=%d b=%d\n", r, g, b);
@@ -136,8 +148,23 @@ class RxCallbacks : public BLECharacteristicCallbacks
             ledOff();
             portENTER_CRITICAL(&stateMux);
             ledActive = false;
+            armed     = false;
             portEXIT_CRITICAL(&stateMux);
             Serial.println("LED OFF");
+
+        /* ── ARM ── */
+        } else if (value == "ARM") {
+            portENTER_CRITICAL(&stateMux);
+            armed = true;
+            portEXIT_CRITICAL(&stateMux);
+            Serial.println("ARMED (listening with LED off)");
+
+        /* ── DISARM ── */
+        } else if (value == "DISARM") {
+            portENTER_CRITICAL(&stateMux);
+            armed = false;
+            portEXIT_CRITICAL(&stateMux);
+            Serial.println("DISARMED");
 
         /* ── TIMEOUT:xxxxx ── */
         } else if (value.rfind("TIMEOUT:", 0) == 0) {
@@ -161,7 +188,7 @@ class RxCallbacks : public BLECharacteristicCallbacks
 };
 
 /* ══════════════════════════════════════════════════════════
- * IR task — polls sensor, sends RT or TIMEOUT to nRF
+ * IR task — polls sensor, sends RT/TAP or TIMEOUT to nRF
  * ══════════════════════════════════════════════════════════ */
 void irTask(void *param)
 {
@@ -172,31 +199,36 @@ void irTask(void *param)
 
         portENTER_CRITICAL(&stateMux);
         bool          isActive = ledActive;
+        bool          isArmed  = armed;
         unsigned long start    = ledOnTimeMs;
         unsigned long t_out    = timeoutMs;
         portEXIT_CRITICAL(&stateMux);
 
-        if (!isActive) {
+        bool polling = isActive || isArmed;
+
+        if (!polling) {
             prevDetected = false;
             continue;
         }
 
-        unsigned long elapsed = millis() - start;
+        /* ── Timeout check (only meaningful while lit) ── */
+        if (isActive) {
+            unsigned long elapsed = millis() - start;
 
-        /* ── Timeout check ── */
-        if (elapsed >= t_out) {
-            ledOff();
-            portENTER_CRITICAL(&stateMux);
-            ledActive = false;
-            portEXIT_CRITICAL(&stateMux);
+            if (elapsed >= t_out) {
+                ledOff();
+                portENTER_CRITICAL(&stateMux);
+                ledActive = false;
+                portEXIT_CRITICAL(&stateMux);
 
-            char msg[32];
-            snprintf(msg, sizeof(msg),
-                     "POD%d:TIMEOUT\n", POD_NUMBER);
-            sendToNrf(msg);
-            Serial.println(msg);
-            prevDetected = false;
-            continue;
+                char msg[32];
+                snprintf(msg, sizeof(msg),
+                         "POD%d:TIMEOUT\n", POD_NUMBER);
+                sendToNrf(msg);
+                Serial.println(msg);
+                prevDetected = false;
+                continue;
+            }
         }
 
         /* ── IR check ── */
@@ -209,19 +241,37 @@ void irTask(void *param)
         prevDetected = detected;
 
         /* Rising edge — hand detected */
-        ledOff();
-        portENTER_CRITICAL(&stateMux);
-        ledActive = false;
-        portEXIT_CRITICAL(&stateMux);
+        if (isActive) {
+            /* Modes 1/2 style: pod was lit, report reaction time */
+            unsigned long elapsed = millis() - start;
 
-        char msg[32];
-        snprintf(msg, sizeof(msg),
-                 "POD%d:RT:%lu\n", POD_NUMBER, elapsed);
-        sendToNrf(msg);
+            ledOff();
+            portENTER_CRITICAL(&stateMux);
+            ledActive = false;
+            armed     = false;
+            portEXIT_CRITICAL(&stateMux);
 
-        Serial.print("RT: ");
-        Serial.print(elapsed);
-        Serial.println(" ms");
+            char msg[32];
+            snprintf(msg, sizeof(msg),
+                     "POD%d:RT:%lu\n", POD_NUMBER, elapsed);
+            sendToNrf(msg);
+
+            Serial.print("RT: ");
+            Serial.print(elapsed);
+            Serial.println(" ms");
+
+        } else {
+            /* Mode 3 style: pod is armed but LED is off — just report
+             * that this pod was tapped, no reaction time attached. */
+            portENTER_CRITICAL(&stateMux);
+            armed = false;
+            portEXIT_CRITICAL(&stateMux);
+
+            char msg[32];
+            snprintf(msg, sizeof(msg), "POD%d:TAP\n", POD_NUMBER);
+            sendToNrf(msg);
+            Serial.println(msg);
+        }
     }
 }
 
