@@ -33,6 +33,19 @@ static const char *pod_names[NUM_ESP32_PODS] = {
     "Blazepod2", "Blazepod3", "Blazepod4"
 };
 
+/* ── Score display ESP32 (Waveshare HUB75 matrix) ───────────
+ * This is the exact BLE name your display sketch advertises via
+ * BLEDevice::init("GAME_Scoreboard"). It is a 4th BLE peripheral,
+ * kept separate from pods[] since it isn't a tap target — it only
+ * ever receives single-character events on its RX characteristic:
+ *   '1' or 'A' -> hit   (increments hits+rounds, plays circle burst)
+ *   '2' or 'D' -> miss  (increments rounds, plays red pulse)
+ *   'R'        -> reset hits/rounds to 0
+ *   'q'        -> cycle colour-blind palette
+ * These are exactly the commands its processCommand() already
+ * understands — no changes needed on the ESP32 side.           */
+#define SCORE_DISPLAY_NAME "GAME_Scoreboard"
+
 /* ── Per-pod state ──────────────────────────────────────── */
 typedef struct {
     struct bt_conn                 *conn;
@@ -46,6 +59,15 @@ typedef struct {
 
 static pod_t pods[NUM_ESP32_PODS];
 
+/* Dedicated connection for the score display. Reuses the same
+ * pod_t shape for convenience, but sub_params/tx_ccc_handle are
+ * unused since we only ever WRITE to it (no notify needed). */
+static pod_t display_dev;
+static bool  connecting_display = false; /* true while a pending
+                                           * bt_conn_le_create()
+                                           * targets display_dev
+                                           * rather than pods[] */
+
 /* ── Thread config ──────────────────────────────────────── */
 #define IR_THREAD_STACK_SIZE    2048
 #define IR_THREAD_PRIORITY      5
@@ -58,18 +80,22 @@ static pod_t pods[NUM_ESP32_PODS];
 #define BUZZ_THREAD_PRIORITY    8
 #define MODE_THREAD_STACK_SIZE  1024
 #define MODE_THREAD_PRIORITY    6
+#define BOOT_THREAD_STACK_SIZE  1024
+#define BOOT_THREAD_PRIORITY    6
 
 K_THREAD_STACK_DEFINE(ir_stack,   IR_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(game_stack, GAME_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(uart_stack, UART_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(buzz_stack, BUZZ_THREAD_STACK_SIZE);
 K_THREAD_STACK_DEFINE(mode_stack, MODE_THREAD_STACK_SIZE);
+K_THREAD_STACK_DEFINE(boot_stack, BOOT_THREAD_STACK_SIZE);
 
 static struct k_thread ir_thread_data;
 static struct k_thread game_thread_data;
 static struct k_thread uart_thread_data;
 static struct k_thread buzz_thread_data;
 static struct k_thread mode_thread_data;
+static struct k_thread boot_thread_data;
 
 /* ── Buzzer message queue ───────────────────────────────── */
 typedef enum {
@@ -103,6 +129,13 @@ static game_mode_t current_mode = GAME_MODE_1;
 static const struct gpio_dt_spec mode_btn =
     GPIO_DT_SPEC_GET(MODE_BUTTON_NODE, gpios);
 static struct gpio_callback button_cb_data;
+
+/* Debounce — a single physical press produces several rapid contact
+ * bounces; without this, each bounce edge fires the ISR and can
+ * advance the mode multiple times for one press. Ignore any edge
+ * that arrives sooner than this after the last one we accepted. */
+#define BUTTON_DEBOUNCE_MS  250
+static int64_t last_button_ms = 0;
 
 /* ── Semaphores ─────────────────────────────────────────── */
 static K_SEM_DEFINE(adv_sem,        0, 1);
@@ -166,12 +199,14 @@ static void send_to_phone(const char *msg);
 static void ir_thread_fn(void *p1, void *p2, void *p3);
 static void game_thread_fn(void *p1, void *p2, void *p3);
 static void mode_switch_thread_fn(void *p1, void *p2, void *p3);
+static void boot_start_thread_fn(void *p1, void *p2, void *p3);
 static void uart_console_thread_fn(void *p1, void *p2, void *p3);
 static void buzz_thread_fn(void *p1, void *p2, void *p3);
 static void start_scan(void);
 static void write_to_pod(int pod_idx, const char *cmd);
 static void turn_off_all_pods(void);
 static void handle_mode3_tap(int tapped_avail_idx);
+static void send_display_event(char c);
 
 /* ══════════════════════════════════════════════════════════
  * Buzzer thread
@@ -241,6 +276,22 @@ static void turn_off_all_pods(void)
 }
 
 /* ══════════════════════════════════════════════════════════
+ * Score display — fire a single-character event at the
+ * GAME_Scoreboard ESP32's existing processCommand() handler.
+ *   '1' = hit (it increments hits+rounds, plays circle burst)
+ *   '2' = miss (it increments rounds, plays red pulse)
+ *   'R' = reset hits/rounds to 0
+ * ══════════════════════════════════════════════════════════ */
+static void send_display_event(char c)
+{
+    if (!display_dev.connected || !display_dev.handles_found) return;
+
+    char buf[1] = { c };
+    bt_gatt_write_without_response(display_dev.conn, display_dev.rx_handle,
+                                    buf, 1, false);
+}
+
+/* ══════════════════════════════════════════════════════════
  * Mode 3 (memory) — judge a single tap against the expected
  * next pod in the sequence. Called with tapped_avail_idx in
  * the same 0..3 encoding used by available[] (0=local pod1,
@@ -272,6 +323,7 @@ static void handle_mode3_tap(int tapped_avail_idx)
             printk("M3:CORRECT\n");
             send_to_phone("MEM:CORRECT\n");
             request_beep(BEEP_SHORT);
+            send_display_event('1');   /* ── NEW: hit on full-sequence win ── */
             k_sem_give(&round_done_sem);
         } else {
             /* Correct so far, still waiting on more taps */
@@ -295,6 +347,7 @@ static void handle_mode3_tap(int tapped_avail_idx)
         printk("M3:WRONG\n");
         send_to_phone("MEM:WRONG\n");
         request_beep(BEEP_DOUBLE);
+        send_display_event('2');   /* ── NEW: miss on wrong tap ── */
         k_sem_give(&round_done_sem);
     }
 }
@@ -363,6 +416,12 @@ static void received_from_phone(struct bt_conn *conn, const void *data,
         } else {
             send_to_phone("TO:ERR\n");
         }
+        return;
+    }
+
+    if (strcmp(msg, "RESET") == 0) {
+        send_display_event('R');
+        send_to_phone("SCORE:RESET\n");
         return;
     }
 
@@ -474,7 +533,8 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
         k_mutex_unlock(&state_mutex);
 
         /* Tap on ESP32 pod → short beep. Pod timeout → long beep. */
-        request_beep(m1_timeout ? BEEP_LONG : BEEP_SHORT);   /* ── NEW ── */
+        request_beep(m1_timeout ? BEEP_LONG : BEEP_SHORT);
+        send_display_event(m1_timeout ? '2' : '1');   /* ── NEW ── */
 
         k_sem_give(&round_done_sem);
         return BT_GATT_ITER_CONTINUE;
@@ -523,6 +583,7 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
         send_to_phone(fwd);
         printk("CORRECT pod%d\n", tapped_avail_idx + 1);
         request_beep(BEEP_SHORT);
+        send_display_event('1');   /* ── NEW ── */
     } else {
         char wrong[32];
         snprintf(wrong, sizeof(wrong), "POD%d:WRONG\n", tapped_avail_idx + 1);
@@ -530,6 +591,7 @@ static uint8_t pod_notify_cb(struct bt_conn *conn,
         printk("WRONG pod%d tapped odd was pod%d\n",
                tapped_avail_idx + 1, odd_pod + 1);
         request_beep(BEEP_LONG);
+        send_display_event('2');   /* ── NEW ── */
     }
 
     k_sem_give(&round_done_sem);
@@ -543,6 +605,24 @@ static uint8_t discover_cb(struct bt_conn *conn,
                             const struct bt_gatt_attr *attr,
                             struct bt_gatt_discover_params *params)
 {
+    /* ── Score display: write-only, no notify subscription ── */
+    if (params == &display_dev.disc_params) {
+        if (!attr) {
+            printk("Discovery done ScoreDisplay rx=%d found=%d\n",
+                   display_dev.rx_handle, display_dev.handles_found);
+            return BT_GATT_ITER_STOP;
+        }
+
+        if (!bt_uuid_cmp(((struct bt_gatt_chrc *)attr->user_data)->uuid,
+                         &nus_rx_uuid.uuid)) {
+            display_dev.rx_handle     = bt_gatt_attr_value_handle(attr);
+            display_dev.handles_found = true;
+            printk("ScoreDisplay RX=%d\n", display_dev.rx_handle);
+        }
+
+        return BT_GATT_ITER_CONTINUE;
+    }
+
     int pod_idx = -1;
     for (int i = 0; i < NUM_ESP32_PODS; i++) {
         if (params == &pods[i].disc_params) {
@@ -612,6 +692,18 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
     char dev_name[32] = {0};
     bt_data_parse(ad_data, parse_device_name, dev_name);
 
+    if (strcmp(dev_name, SCORE_DISPLAY_NAME) == 0 &&
+        !display_dev.connected) {
+        printk("Found %s (score display)\n", dev_name);
+        bt_le_scan_stop();
+        connecting_display = true;
+        struct bt_conn *conn = NULL;
+        bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+                          BT_LE_CONN_PARAM_DEFAULT, &conn);
+        if (conn) bt_conn_unref(conn);
+        return;
+    }
+
     for (int i = 0; i < NUM_ESP32_PODS; i++) {
         if (strcmp(dev_name, pod_names[i]) == 0 &&
             !pods[i].connected) {
@@ -629,9 +721,11 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
 
 static void start_scan(void)
 {
-    bool need = false;
-    for (int i = 0; i < NUM_ESP32_PODS; i++) {
-        if (!pods[i].connected) { need = true; break; }
+    bool need = !display_dev.connected;
+    if (!need) {
+        for (int i = 0; i < NUM_ESP32_PODS; i++) {
+            if (!pods[i].connected) { need = true; break; }
+        }
     }
     if (!need) return;
 
@@ -653,6 +747,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
     if (err) {
         printk("Conn failed err=%d\n", err);
         last_connecting_pod = -1;
+        connecting_display  = false;
         start_scan();
         return;
     }
@@ -661,6 +756,25 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
     bt_conn_get_info(conn, &info);
 
     if (info.role == BT_CONN_ROLE_CENTRAL) {
+
+        if (connecting_display) {
+            connecting_display = false;
+
+            display_dev.conn      = bt_conn_ref(conn);
+            display_dev.connected = true;
+            printk("Score display connected\n");
+
+            display_dev.disc_params.uuid         = NULL;
+            display_dev.disc_params.func         = discover_cb;
+            display_dev.disc_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+            display_dev.disc_params.end_handle   = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+            display_dev.disc_params.type         = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+            bt_gatt_discover(conn, &display_dev.disc_params);
+            start_scan();
+            return;
+        }
+
         int idx = last_connecting_pod;
         last_connecting_pod = -1;
 
@@ -697,6 +811,18 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
     bt_conn_get_info(conn, &info);
 
     if (info.role == BT_CONN_ROLE_CENTRAL) {
+
+        if (conn == display_dev.conn) {
+            printk("Score display disconnected\n");
+            bt_conn_unref(display_dev.conn);
+            display_dev.conn          = NULL;
+            display_dev.connected     = false;
+            display_dev.handles_found = false;
+            display_dev.rx_handle     = 0;
+            start_scan();
+            return;
+        }
+
         for (int i = 0; i < NUM_ESP32_PODS; i++) {
             if (pods[i].conn == conn) {
                 printk("Pod%d disconnected\n", i + 2);
@@ -757,6 +883,12 @@ static void button_pressed(const struct device *dev,
         return;
     }
 
+    int64_t now = k_uptime_get();
+    if ((now - last_button_ms) < BUTTON_DEBOUNCE_MS) {
+        return;   /* bounce — ignore, don't advance the mode again */
+    }
+    last_button_ms = now;
+
     k_sem_give(&mode_switch_sem);   /* ISR-safe — no blocking here */
 }
 
@@ -781,6 +913,10 @@ static void mode_switch_thread_fn(void *p1, void *p2, void *p3)
             send_to_phone("MODE:1\n");
         }
 
+        /* Each mode is scored independently, so start every mode
+         * switch with a clean scoreboard on the LED matrix. */
+        send_display_event('R');
+
         k_mutex_lock(&state_mutex, K_FOREVER);
         bool running = game_running;
         k_mutex_unlock(&state_mutex);
@@ -796,6 +932,56 @@ static void mode_switch_thread_fn(void *p1, void *p2, void *p3)
             k_sem_give(&game_start_sem);
         }
     }
+}
+
+/* ══════════════════════════════════════════════════════════
+ * Boot auto-start thread
+ *
+ * Waits BOOT_START_DELAY after power-on (giving the ESP32 pods
+ * time to finish connecting/discovering over BLE), then starts
+ * a round automatically — no phone or GUI needed. Uses whatever
+ * mode/colour is already selected at boot (current_mode defaults
+ * to GAME_MODE_1, game_r/g/b defaults to RED, game3_r/g/b
+ * defaults to YELLOW). The mode button and phone/GUI STOP/START
+ * commands still work normally after this; this thread only
+ * fires once.
+ * ══════════════════════════════════════════════════════════ */
+#define BOOT_START_DELAY_S  10
+
+static void auto_start_game(void)
+{
+    k_mutex_lock(&state_mutex, K_FOREVER);
+    bool already = game_running;
+    k_mutex_unlock(&state_mutex);
+    if (already) return;
+
+    k_mutex_lock(&state_mutex, K_FOREVER);
+    game_running = true;
+    k_mutex_unlock(&state_mutex);
+    k_sem_give(&game_start_sem);
+
+    if (current_mode == GAME_MODE_1) {
+        printk("Mode 1 GO (R=%02X G=%02X B=%02X) [auto-start]\n",
+               game_r, game_g, game_b);
+        send_to_phone("M1:GO\n");
+    } else if (current_mode == GAME_MODE_2) {
+        printk("Mode 2 GO [auto-start]\n");
+        send_to_phone("M2:GO\n");
+    } else {
+        printk("Mode 3 GO (R=%02X G=%02X B=%02X) [auto-start]\n",
+               game3_r, game3_g, game3_b);
+        send_to_phone("M3:GO\n");
+    }
+}
+
+static void boot_start_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    k_sleep(K_SECONDS(BOOT_START_DELAY_S));
+
+    printk("Boot delay elapsed — auto-starting game\n");
+    auto_start_game();
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -840,6 +1026,9 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
 
                 send_to_phone("POD1:TO\n");
                 request_beep(BEEP_LONG);
+                if (mode == GAME_MODE_1) {
+                    send_display_event('2');   /* ── NEW ── */
+                }
 
                 if (mode == GAME_MODE_1) {
                     k_sem_give(&round_done_sem);
@@ -877,6 +1066,7 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
             send_to_phone(msg);
             printk("%s", msg);
             request_beep(BEEP_SHORT);
+            send_display_event('1');   /* ── NEW ── */
             k_sem_give(&round_done_sem);
 
         } else if (mode == GAME_MODE_2) {
@@ -893,10 +1083,12 @@ static void ir_thread_fn(void *p1, void *p2, void *p3)
                 send_to_phone(msg);
                 printk("%s", msg);
                 request_beep(BEEP_SHORT);
+                send_display_event('1');   /* ── NEW ── */
             } else {
                 send_to_phone("POD1:WRONG\n");
                 printk("POD1:WRONG\n");
                 request_beep(BEEP_LONG);
+                send_display_event('2');   /* ── NEW ── */
             }
             k_sem_give(&round_done_sem);
 
@@ -975,7 +1167,8 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
              * race the dongle's own deadline over the BLE link and
              * never arrive before we already turn the pod off. */
             if (sem_ret != 0) {
-                request_beep(BEEP_LONG);   /* ── FIX: dongle-driven Mode 1 timeout beep ── */
+                request_beep(BEEP_LONG);   /* dongle-driven Mode 1 timeout beep */
+                send_display_event('2');   /* ── NEW ── */
             }
 
         } else if (mode == GAME_MODE_2) {
@@ -1042,6 +1235,7 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
             if (sem_ret != 0) {
                 send_to_phone("ROUND:TO\n");
                 request_beep(BEEP_LONG);
+                send_display_event('2');   /* ── NEW ── */
             }
 
         } else if (mode == GAME_MODE_3) {
@@ -1144,6 +1338,7 @@ static void game_thread_fn(void *p1, void *p2, void *p3)
                     send_to_phone("MEM:TO\n");
                     printk("M3:TIMEOUT\n");
                     request_beep(BEEP_DOUBLE);
+                    send_display_event('2');   /* ── NEW ── */
                 }
             } else {
                 k_mutex_lock(&state_mutex, K_FOREVER);
@@ -1173,7 +1368,7 @@ static void uart_console_thread_fn(void *p1, void *p2, void *p3)
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
     printk("UART console ready — type commands:\n");
-    printk("  START, STOP, RED, GREEN, BLUE, YELLOW, PINK, VIOLET, TIMEOUT:N\n");
+    printk("  START, STOP, RESET, RED, GREEN, BLUE, YELLOW, PINK, VIOLET, TIMEOUT:N\n");
     printk("  (Mode 3 memory game: pick a colour or START, default YELLOW)\n");
 
     while (true) {
@@ -1202,6 +1397,13 @@ static void uart_console_thread_fn(void *p1, void *p2, void *p3)
             } else {
                 printk("TIMEOUT error (1-60)\n");
             }
+            continue;
+        }
+
+        if (strcmp(cmd, "RESET") == 0) {
+            send_display_event('R');
+            printk("Display score reset\n");
+            send_to_phone("SCORE:RESET\n");
             continue;
         }
 
@@ -1301,7 +1503,9 @@ int main(void)
     if (buzzer_init() != 0) { printk("Buzzer failed\n"); return 0; }
 
     memset(pods, 0, sizeof(pods));
+    memset(&display_dev, 0, sizeof(display_dev));
     last_connecting_pod = -1;
+    connecting_display  = false;
 
     k_thread_create(&ir_thread_data, ir_stack,
                     K_THREAD_STACK_SIZEOF(ir_stack),
@@ -1326,6 +1530,12 @@ int main(void)
                     mode_switch_thread_fn, NULL, NULL, NULL,
                     MODE_THREAD_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&mode_thread_data, "mode_switch");
+
+    k_thread_create(&boot_thread_data, boot_stack,
+                    K_THREAD_STACK_SIZEOF(boot_stack),
+                    boot_start_thread_fn, NULL, NULL, NULL,
+                    BOOT_THREAD_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&boot_thread_data, "boot_start");
 
     console_getline_init();
 
