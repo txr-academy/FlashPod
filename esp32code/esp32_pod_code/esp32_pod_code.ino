@@ -7,8 +7,8 @@
 #include "soc/rtc_cntl_reg.h"
 
 /* ── Pod identity — CHANGE THIS per ESP32 ───────────────── */
-#define POD_NUMBER   2
-#define POD_NAME     "Blazepod2"
+#define POD_NUMBER   4
+#define POD_NAME     "Blazepod4"
 
 /* ── Pin config ─────────────────────────────────────────── */
 #define LED_PIN      16
@@ -77,10 +77,13 @@ void sendToNrf(const char *msg)
 class ServerCallbacks : public BLEServerCallbacks
 {
     void onConnect(BLEServer *pSvr) override
-    {
-        deviceConnected = true;
-        Serial.println("nRF connected");
-    }
+{
+    deviceConnected = true;
+
+    ledSetAll(0, 255, 0);  // GREEN: nRF connected
+
+    Serial.println("nRF connected");
+}
 
     void onDisconnect(BLEServer *pSvr) override
     {
@@ -114,7 +117,7 @@ class RxCallbacks : public BLECharacteristicCallbacks
 {
     void onWrite(BLECharacteristic *pChar) override
     {
-        std::string value = pChar->getValue();
+        std::string value = pChar->getValue().c_str();
         if (value.empty()) return;
 
         /* Strip trailing newline/carriage return */
@@ -335,5 +338,28 @@ void setup()
  * ══════════════════════════════════════════════════════════ */
 void loop()
 {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    static unsigned long lastBlinkMs = 0;
+    static bool redOn = false;
+
+    // Blink red only when the nRF is NOT connected
+    if (!deviceConnected)
+    {
+        if (millis() - lastBlinkMs >= 500)
+        {
+            lastBlinkMs = millis();
+            redOn = !redOn;
+
+            if (redOn)
+            {
+                ledSetAll(255, 0, 0);  // RED ON
+            }
+            else
+            {
+                ledOff();              // RED OFF
+            }
+        }
+    }
+
+    // Check frequently so blinking stays smooth
+    vTaskDelay(pdMS_TO_TICKS(20));
 }
